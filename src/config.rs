@@ -1,0 +1,137 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::RwLock;
+use tracing::{info, warn};
+
+/// OAuth / API constants derived from the official codex-rs source.
+pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
+pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
+pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+pub const UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/codex";
+pub const SCOPES: &str = "openid profile email offline_access";
+pub const AUTH_DIR: &str = ".codex";
+pub const AUTH_FILE: &str = "auth.json";
+
+/// Fallback version if dynamic fetch fails.
+pub const FALLBACK_CLIENT_VERSION: &str = "0.125.0";
+
+/// How often to refresh the version from npm in the background.
+const VERSION_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60); // 6 hours
+
+/// Seconds before token expiry at which we trigger a refresh.
+pub const REFRESH_MARGIN_SECS: i64 = 300; // 5 minutes
+
+/// How long the models cache is valid (seconds).
+pub const MODELS_CACHE_TTL_SECS: u64 = 300; // 5 minutes
+
+/// Reasoning effort levels recognised in model-name suffixes.
+pub const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
+
+// ── Shared application state ──────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct AppState {
+    pub http: reqwest::Client,
+    pub port: u16,
+    pub models_cache: Arc<crate::models::ModelsCache>,
+    /// Dynamically updated Codex client version.
+    client_version: Arc<RwLock<String>>,
+    /// Dynamically updated User-Agent string.
+    codex_user_agent: Arc<RwLock<String>>,
+}
+
+impl AppState {
+    pub fn new(port: u16, version: String) -> Self {
+        let user_agent = format!("codex-tui/{version} (Mac OS 26.3.1; arm64)");
+        let http = reqwest::Client::builder()
+            .user_agent(&user_agent)
+            .build()
+            .expect("failed to build HTTP client");
+        Self {
+            http,
+            port,
+            models_cache: Arc::new(crate::models::ModelsCache::new()),
+            client_version: Arc::new(RwLock::new(version)),
+            codex_user_agent: Arc::new(RwLock::new(user_agent)),
+        }
+    }
+
+    pub async fn client_version(&self) -> String {
+        self.client_version.read().await.clone()
+    }
+
+    pub async fn codex_user_agent(&self) -> String {
+        self.codex_user_agent.read().await.clone()
+    }
+}
+
+/// Fetch the latest Codex CLI version from npm registry.
+/// Falls back to FALLBACK_CLIENT_VERSION on any error.
+pub async fn fetch_latest_codex_version() -> String {
+    let client = reqwest::Client::new();
+    match client
+        .get("https://registry.npmjs.org/@openai/codex/latest")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
+                    return version.to_string();
+                }
+            }
+        }
+        Ok(resp) => {
+            warn!("npm registry returned status {}", resp.status());
+        }
+        Err(e) => {
+            warn!("Failed to fetch Codex version from npm: {e}");
+        }
+    }
+    FALLBACK_CLIENT_VERSION.to_string()
+}
+
+/// Update the version stored in AppState (called by background task).
+async fn update_version(state: &Arc<AppState>) {
+    let version = fetch_latest_codex_version().await;
+    let user_agent = format!("codex-tui/{version} (Mac OS 26.3.1; arm64)");
+    {
+        let mut cv = state.client_version.write().await;
+        *cv = version.clone();
+    }
+    {
+        let mut ua = state.codex_user_agent.write().await;
+        *ua = user_agent;
+    }
+    info!("Updated Codex client version to {version}");
+}
+
+/// Spawn a background task that periodically refreshes the version.
+pub fn spawn_version_refresher(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(VERSION_REFRESH_INTERVAL).await;
+            update_version(&state).await;
+        }
+    });
+}
+
+/// Build AppState with dynamically fetched client version.
+pub async fn make_state(port: u16, version_override: Option<String>) -> Arc<AppState> {
+    let version = match version_override {
+        Some(v) => {
+            info!("Using pinned Codex client version: {v}");
+            v
+        }
+        None => {
+            let v = fetch_latest_codex_version().await;
+            info!("Using Codex client version: {v}");
+            v
+        }
+    };
+    Arc::new(AppState::new(port, version))
+}

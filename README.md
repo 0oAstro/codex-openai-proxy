@@ -1,203 +1,121 @@
-# Codex OpenAI Proxy
+# codex-openai-proxy
 
-A proxy server that allows CLINE (Claude Code) and other OpenAI-compatible extensions to use ChatGPT Plus tokens from Codex authentication instead of requiring separate OpenAI API keys.
-
-## Overview
-
-This proxy bridges the gap between:
-- **Input**: Standard OpenAI Chat Completions API format (what CLINE expects)
-- **Output**: ChatGPT Responses API format (what ChatGPT backend uses)
+Proxy your ChatGPT/Codex subscription as an OpenAI-compatible API.
 
 ## Features
 
-- ✅ **OpenAI API Compatibility**: Accepts standard OpenAI Chat Completions requests
-- ✅ **ChatGPT Plus Integration**: Uses your existing ChatGPT Plus tokens  
-- ✅ **Cloudflare Bypass**: Handles ChatGPT's Cloudflare protection with browser-like headers
-- ✅ **HTTPS Support**: Works with extensions requiring secure connections (via ngrok)
-- ✅ **Streaming Responses**: Full streaming support for real-time responses
-- ✅ **CLINE Compatible**: Tested extensively with CLINE VS Code extension
-- ✅ **Array Content Support**: Handles both string and array message formats from OpenAI SDK
-- ✅ **Universal Routing**: Bulletproof request routing that bypasses complex warp conflicts
+- **OpenAI-compatible endpoints**: `/v1/models`, `/v1/responses`, `/v1/chat/completions`
+- **OAuth PKCE login**: browser-based authentication with automatic token refresh
+- **Streaming support**: SSE streaming for both responses and chat completions
+- **Chat completions translation**: translates OpenAI chat format to/from Codex Responses API
+- **Reasoning effort**: parse model name suffixes (e.g. `gpt-5.5-xhigh`) into reasoning parameters
+- **Tool/function calling**: full support for function calling in chat completions
+- **Token auto-refresh**: refreshes tokens 5 minutes before expiry
+- **401 retry**: automatically refreshes and retries on auth failures
 
 ## Quick Start
 
-### 1. Build and Run
-
 ```bash
-git clone https://github.com/Securiteru/codex-openai-proxy.git
-cd codex-openai-proxy
+# Build
 cargo build --release
-./target/release/codex-openai-proxy --port 8888 --auth-path ~/.codex/auth.json
+
+# Log in (opens browser)
+./target/release/codex-openai-proxy login
+
+# Start the proxy
+./target/release/codex-openai-proxy serve
+
+# Check auth status
+./target/release/codex-openai-proxy auth status
+
+# Log out
+./target/release/codex-openai-proxy logout
 ```
 
-### 2. Setup HTTPS Tunnel (Required for CLINE)
+## Usage
 
-Most VS Code extensions require HTTPS:
+### Start the server
 
 ```bash
-# Install ngrok and create your own static domain at https://dashboard.ngrok.com/domains
-# Replace 'your-static-domain' with your unique domain name
-ngrok http 8888 --domain=your-static-domain.ngrok-free.app
-```
+# Default: 0.0.0.0:8080
+codex-openai-proxy serve
 
-**Security Note**: Always use your own unique ngrok domain. Do not share your domain publicly to prevent unauthorized access to your proxy.
+# Custom port
+codex-openai-proxy serve --port 3000
 
-### 3. Configure CLINE Extension
-
-In VS Code CLINE settings:
-- **Base URL**: `https://your-static-domain.ngrok-free.app`
-- **Model**: `gpt-5` (or `gpt-4`)
-- **API Key**: Any value (not used, but required by extension)
-
-### 4. Test Connection
-
-```bash
-# Health check
-curl https://your-static-domain.ngrok-free.app/health
-
-# Test completion
-curl -X POST https://your-static-domain.ngrok-free.app/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer test-key" \
-  -d '{
-    "model": "gpt-5",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
-## How It Works
-
-### Request Flow
-
-1. **CLINE** → Chat Completions format → **Proxy**
-2. **Proxy** → Converts to Responses API → **ChatGPT Backend**
-3. **ChatGPT Backend** → Responses API format → **Proxy**
-4. **Proxy** → Converts to Chat Completions → **CLINE**
-
-### Format Conversion
-
-**Chat Completions Request:**
-```json
-{
-  "model": "gpt-5",
-  "messages": [
-    {"role": "user", "content": "Hello!"}
-  ]
-}
-```
-
-**Responses API Request:**
-```json
-{
-  "model": "gpt-5", 
-  "instructions": "You are a helpful AI assistant.",
-  "input": [
-    {
-      "type": "message",
-      "role": "user", 
-      "content": [{"type": "input_text", "text": "Hello!"}]
-    }
-  ],
-  "tools": [],
-  "tool_choice": "auto",
-  "store": false,
-  "stream": false
-}
-```
-
-## Configuration
-
-### Command Line Options
-
-```bash
-codex-openai-proxy [OPTIONS]
-
-Options:
-  -p, --port <PORT>          Port to listen on [default: 8080]
-      --auth-path <PATH>     Path to Codex auth.json [default: ~/.codex/auth.json]
-  -h, --help                 Print help
-  -v, --version              Print version
+# Or via environment variable
+PORT=3000 codex-openai-proxy serve
 ```
 
 ### Authentication
 
-The proxy automatically reads authentication from your Codex `auth.json` file:
+```bash
+# Browser login (OAuth PKCE)
+codex-openai-proxy login
 
-```json
-{
-  "access_token": "eyJ...",
-  "account_id": "db1fc050-5df3-42c1-be65-9463d9d23f0b",
-  "api_key": "sk-proj-..."
-}
+# Check status
+codex-openai-proxy auth status
+
+# Logout
+codex-openai-proxy logout
 ```
 
-**Priority**: Uses `access_token` + `account_id` for ChatGPT Plus accounts, falls back to `api_key` for standard OpenAI accounts.
+Credentials are stored in `~/.codex/auth.json`.
 
 ## API Endpoints
 
-### Health Check
-- **GET** `/health`
-- Returns service status
+### `GET /health`
+Returns `{"status": "ok"}`.
 
-### Chat Completions
-- **POST** `/v1/chat/completions`
-- OpenAI-compatible chat completions endpoint
-- Supports: messages, model, temperature, max_tokens, stream, tools
+### `GET /v1/models`
+Returns available models in OpenAI format. Cached for 5 minutes.
 
-## Troubleshooting
+### `POST /v1/responses`
+Passthrough to the Codex Responses API. Streams SSE response back verbatim.
 
-### Common Issues
+### `POST /v1/chat/completions`
+Translates OpenAI chat completions format to Codex Responses API and back.
+Supports both streaming (`"stream": true`) and non-streaming modes.
 
-**Connection Refused:**
-```bash
-# Check if proxy is running
-curl http://localhost:8080/health
+#### Reasoning effort
+Append a reasoning suffix to the model name:
+```
+gpt-5.5-none     -> reasoning: none
+gpt-5.5-minimal  -> reasoning: minimal
+gpt-5.5-low      -> reasoning: low
+gpt-5.5-medium   -> reasoning: medium
+gpt-5.5-high     -> reasoning: high
+gpt-5.5-xhigh    -> reasoning: xhigh
 ```
 
-**Authentication Errors:**
-```bash
-# Verify auth.json exists and has valid tokens
-cat ~/.codex/auth.json | jq .
-```
-
-**Backend Errors:**
-```bash
-# Check proxy logs for detailed error messages
-RUST_LOG=debug cargo run
-```
-
-### Debug Mode
+## Docker
 
 ```bash
-# Run with debug logging
-RUST_LOG=debug cargo run -- --port 8080
-
-# Test with verbose curl
-curl -v -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "gpt-5", "messages": [{"role": "user", "content": "Test"}]}'
+docker build -t codex-openai-proxy .
+docker run -p 8080:8080 -v ~/.codex:/root/.codex codex-openai-proxy
 ```
 
-## Development
+## Example: Using with OpenAI SDK
 
-### Building
+```python
+from openai import OpenAI
 
-```bash
-cargo build
-cargo test
-cargo clippy
-cargo fmt
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed"  # Auth is handled by the proxy
+)
+
+response = client.chat.completions.create(
+    model="gpt-5.5",
+    messages=[{"role": "user", "content": "Hello!"}],
+    stream=True,
+)
+
+for chunk in response:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="")
 ```
-
-### Adding Features
-
-The proxy is designed to be extensible:
-
-- **New endpoints**: Add routes in `main.rs`
-- **Format conversion**: Modify conversion functions
-- **Authentication**: Extend `AuthData` structure
-- **Streaming**: Add SSE support for real-time responses
 
 ## License
 
-This project is part of the Codex ecosystem and follows the same licensing as the main Codex repository.
+MIT
