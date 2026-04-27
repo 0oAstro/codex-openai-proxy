@@ -1,3 +1,4 @@
+use axum::response::IntoResponse;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
@@ -8,7 +9,11 @@ mod models;
 mod proxy;
 
 #[derive(Parser)]
-#[command(name = "codex-openai-proxy", version, about = "Proxy ChatGPT/Codex subscription as an OpenAI-compatible API")]
+#[command(
+    name = "codex-openai-proxy",
+    version,
+    about = "Proxy ChatGPT/Codex subscription as an OpenAI-compatible API"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,6 +35,8 @@ enum Commands {
     },
     /// Log in via OAuth PKCE browser flow
     Login,
+    /// Log in via device code (for headless/SSH)
+    LoginDevice,
     /// Remove stored credentials
     Logout,
     /// Authentication-related commands
@@ -70,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
             codex_version,
         } => run_server(port, &host, codex_version).await,
         Commands::Login => run_login().await,
+        Commands::LoginDevice => run_login_device().await,
         Commands::Logout => run_logout().await,
         Commands::Auth { sub } => match sub {
             AuthCommands::Status => run_auth_status().await,
@@ -77,16 +85,39 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// API key auth middleware. If PROXY_API_KEY is set, validate Bearer token.
+async fn auth_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(expected) = config::proxy_api_key() {
+        let provided = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match provided {
+            Some(key) if key == expected => next.run(req).await,
+            _ => axum::http::StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else {
+        next.run(req).await
+    }
+}
+
 async fn run_server(port: u16, host: &str, codex_version: Option<String>) -> anyhow::Result<()> {
     let state = config::make_state(port, codex_version).await;
     config::spawn_version_refresher(state.clone());
 
+    if config::proxy_api_key().is_some() {
+        info!("Proxy API key auth enabled");
+    } else {
+        info!("Proxy API key auth disabled (set PROXY_API_KEY to enable)");
+    }
+
     let app = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
-        .route(
-            "/v1/models",
-            axum::routing::get(models::handle_models),
-        )
+        .route("/v1/models", axum::routing::get(models::handle_models))
         .route(
             "/v1/responses",
             axum::routing::post(proxy::handle_responses),
@@ -95,6 +126,7 @@ async fn run_server(port: u16, host: &str, codex_version: Option<String>) -> any
             "/v1/chat/completions",
             axum::routing::post(chat::handle_chat_completions),
         )
+        .layer(axum::middleware::from_fn(auth_middleware))
         .with_state(state);
 
     let addr = format!("{host}:{port}");
@@ -111,6 +143,15 @@ async fn health_handler() -> axum::Json<serde_json::Value> {
 async fn run_login() -> anyhow::Result<()> {
     let tokens = auth::login_flow().await?;
     println!("Logged in successfully.");
+    if let Some(ref aid) = tokens.account_id {
+        println!("Account ID: {aid}");
+    }
+    Ok(())
+}
+
+async fn run_login_device() -> anyhow::Result<()> {
+    let tokens = auth::device_login_flow().await?;
+    println!("Logged in successfully via device code.");
     if let Some(ref aid) = tokens.account_id {
         println!("Account ID: {aid}");
     }

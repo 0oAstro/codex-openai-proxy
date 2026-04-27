@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
 use crate::config::{
-    AUTH_DIR, AUTH_FILE, AUTH_URL, CLIENT_ID, REDIRECT_URI, REFRESH_MARGIN_SECS, REVOKE_URL,
-    SCOPES, TOKEN_URL,
+    AUTH_FILE, AUTH_URL, CLIENT_ID, REDIRECT_URI, REFRESH_MARGIN_SECS, REVOKE_URL, SCOPES,
+    TOKEN_URL,
 };
 
 // ── Stored token data ─────────────────────────────────────────────────────
@@ -30,10 +30,10 @@ pub struct AuthTokens {
 }
 
 impl AuthTokens {
-    /// Return the auth file path (`~/.codex/auth.json`).
+    /// Return the auth file path (`~/auth.json`).
     pub fn path() -> PathBuf {
         let home = dirs_home();
-        home.join(AUTH_DIR).join(AUTH_FILE)
+        home.join(AUTH_FILE)
     }
 
     /// Load tokens from disk. Returns `None` if the file does not exist.
@@ -106,10 +106,16 @@ fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
 pub fn extract_account_id(token: &str) -> Option<String> {
     let claims = decode_jwt_payload(token)?;
     // Prefer the dedicated claim.
-    if let Some(v) = claims.get("https://api.openai.com/auth").and_then(|v| v.as_str()) {
+    if let Some(v) = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|v| v.as_str())
+    {
         return Some(v.to_string());
     }
-    claims.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string())
+    claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 // ── PKCE ──────────────────────────────────────────────────────────────────
@@ -130,7 +136,10 @@ impl PkceChallenge {
         let hash = hasher.finalize();
         let challenge = URL_SAFE_NO_PAD.encode(hash);
 
-        Self { verifier, challenge }
+        Self {
+            verifier,
+            challenge,
+        }
     }
 }
 
@@ -201,7 +210,9 @@ pub async fn login_flow() -> anyhow::Result<AuthTokens> {
         }
     });
 
-    let code = rx.await.map_err(|_| anyhow::anyhow!("Callback server closed without receiving code"))?;
+    let code = rx
+        .await
+        .map_err(|_| anyhow::anyhow!("Callback server closed without receiving code"))?;
     handle.abort();
 
     info!("Received authorization code, exchanging for tokens…");
@@ -294,11 +305,129 @@ pub async fn ensure_valid_token(tokens: AuthTokens) -> anyhow::Result<AuthTokens
     }
     match tokens.refresh_token.as_deref() {
         Some(rt) => refresh_token(rt).await,
-        None => anyhow::bail!("Token expired and no refresh token available. Please run `codex-openai-proxy login`."),
+        None => anyhow::bail!(
+            "Token expired and no refresh token available. Please run `codex-openai-proxy login`."
+        ),
     }
 }
 
 // ── internals ─────────────────────────────────────────────────────────────
+
+// ── Device code login (for headless/SSH) ──────────────────────────────────
+
+const DEVICE_AUTH_BASE: &str = "https://auth.openai.com/api/accounts";
+const DEVICE_VERIFY_URL: &str = "https://auth.openai.com/codex/device";
+
+/// Perform device code login (for headless environments).
+/// 1. Request a user code from the device auth endpoint
+/// 2. Print the URL and code for the user to visit
+/// 3. Poll until the user authorizes
+/// 4. Exchange the resulting code for tokens
+pub async fn device_login_flow() -> anyhow::Result<AuthTokens> {
+    let client = reqwest::Client::new();
+
+    // Step 1: Request user code
+    info!("Requesting device code…");
+    let resp = client
+        .post(format!("{DEVICE_AUTH_BASE}/deviceauth/usercode"))
+        .json(&serde_json::json!({"client_id": CLIENT_ID}))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Device code request failed ({status}): {body}");
+    }
+
+    let dc: DeviceCodeResp = resp.json().await?;
+    println!(
+        "\nOpen this URL in any browser:\n  https://auth.openai.com/codex/device\n\nEnter this code:\n  {}\n\n(expires in 15 minutes)",
+        dc.user_code
+    );
+
+    // Step 2: Poll for authorization
+    let poll_interval = std::time::Duration::from_secs(dc.interval.max(5));
+    let max_wait = std::time::Duration::from_secs(15 * 60);
+    let start = std::time::Instant::now();
+
+    let code_resp = loop {
+        if start.elapsed() >= max_wait {
+            anyhow::bail!("Device code timed out after 15 minutes");
+        }
+
+        tokio::time::sleep(poll_interval).await;
+
+        let poll_resp = client
+            .post(format!("{DEVICE_AUTH_BASE}/deviceauth/token"))
+            .json(&serde_json::json!({
+                "device_auth_id": dc.device_auth_id,
+                "user_code": dc.user_code,
+            }))
+            .send()
+            .await?;
+
+        if poll_resp.status().is_success() {
+            break poll_resp.json::<DeviceCodeSuccessResp>().await?;
+        }
+
+        // 403/404 = still pending, keep polling
+        let status = poll_resp.status();
+        if status != reqwest::StatusCode::FORBIDDEN && status != reqwest::StatusCode::NOT_FOUND {
+            let body = poll_resp.text().await.unwrap_or_default();
+            anyhow::bail!("Device auth failed ({status}): {body}");
+        }
+    };
+
+    info!("Device code authorized, exchanging for tokens…");
+
+    // Step 3: Exchange authorization_code via standard PKCE token exchange
+    // The device auth flow returns authorization_code + PKCE codes server-side
+    let redirect_uri = format!("{DEVICE_AUTH_BASE}/deviceauth/callback");
+    let token_resp = client
+        .post(TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "grant_type=authorization_code&client_id={}&code={}&redirect_uri={}&code_verifier={}",
+            CLIENT_ID,
+            urlencoding::encode(&code_resp.authorization_code),
+            urlencoding::encode(&redirect_uri),
+            urlencoding::encode(&code_resp.code_verifier),
+        ))
+        .send()
+        .await?;
+
+    if !token_resp.status().is_success() {
+        let status = token_resp.status();
+        let body = token_resp.text().await.unwrap_or_default();
+        anyhow::bail!("Token exchange failed ({status}): {body}");
+    }
+
+    let raw: serde_json::Value = token_resp.json().await?;
+    let tokens = parse_token_response(raw)?;
+    tokens.save()?;
+    info!("Device code login successful!");
+    Ok(tokens)
+}
+
+#[derive(Deserialize)]
+struct DeviceCodeResp {
+    user_code: String,
+    device_auth_id: String,
+    #[serde(default = "default_interval")]
+    interval: u64,
+}
+
+fn default_interval() -> u64 {
+    5
+}
+
+#[derive(Deserialize)]
+struct DeviceCodeSuccessResp {
+    authorization_code: String,
+    code_challenge: String,
+    code_verifier: String,
+}
 
 fn parse_token_response(raw: serde_json::Value) -> anyhow::Result<AuthTokens> {
     let access_token = raw["access_token"]

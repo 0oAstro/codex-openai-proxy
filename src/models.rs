@@ -102,7 +102,7 @@ impl ModelsCache {
             .map_err(|e| format!("Failed to parse upstream models response: {e}"))?;
 
         let now = Instant::now();
-        let data: Vec<OpenAIModel> = upstream
+        let mut data: Vec<OpenAIModel> = upstream
             .models
             .into_iter()
             .map(|m| OpenAIModel {
@@ -112,6 +112,20 @@ impl ModelsCache {
                 owned_by: "openai",
             })
             .collect();
+
+        // Force-inject built-in models (e.g. gpt-image-2) that upstream may not list.
+        let existing_ids: std::collections::HashSet<String> =
+            data.iter().map(|m| m.id.clone()).collect();
+        for id in crate::config::BUILTIN_MODELS {
+            if !existing_ids.contains(*id) {
+                data.push(OpenAIModel {
+                    id: id.to_string(),
+                    object: "model",
+                    created: 1_700_000_000,
+                    owned_by: "openai",
+                });
+            }
+        }
 
         let result = data.clone();
         {

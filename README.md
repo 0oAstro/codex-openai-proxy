@@ -60,7 +60,7 @@ codex-openai-proxy auth status
 codex-openai-proxy logout
 ```
 
-Credentials are stored in `~/.codex/auth.json`.
+Credentials are stored in `~/auth.json`.
 
 ## API Endpoints
 
@@ -88,12 +88,14 @@ gpt-5.5-high     -> reasoning: high
 gpt-5.5-xhigh    -> reasoning: xhigh
 ```
 
-## Docker
+## Docker Compose (preferred)
 
 ```bash
-docker build -t codex-openai-proxy .
-docker run -p 8080:8080 -v ~/.codex:/root/.codex codex-openai-proxy
+docker network create main-network
+docker compose up -d
 ```
+
+The container mounts `/opt/codex-openai-proxy/auth.json` from the host to `/root/auth.json` in the container.
 
 ## Example: Using with OpenAI SDK
 

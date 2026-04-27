@@ -12,7 +12,7 @@ pub const REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
 pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 pub const UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/codex";
 pub const SCOPES: &str = "openid profile email offline_access";
-pub const AUTH_DIR: &str = ".codex";
+/// Auth file lives directly at `~/auth.json`.
 pub const AUTH_FILE: &str = "auth.json";
 
 /// Fallback version if dynamic fetch fails.
@@ -29,6 +29,15 @@ pub const MODELS_CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
 /// Reasoning effort levels recognised in model-name suffixes.
 pub const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
+
+/// Built-in models to force-inject into the models list (not returned by upstream).
+pub const BUILTIN_MODELS: &[&str] = &["gpt-image-2"];
+
+/// Read the proxy API key from the `PROXY_API_KEY` env var.
+/// If set, all requests (except /health) require `Authorization: Bearer <key>`.
+pub fn proxy_api_key() -> Option<String> {
+    std::env::var("PROXY_API_KEY").ok()
+}
 
 // ── Shared application state ──────────────────────────────────────────────
 
