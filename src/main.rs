@@ -90,6 +90,10 @@ async fn auth_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+
     if let Some(expected) = config::proxy_api_key() {
         let provided = req
             .headers()
