@@ -16,7 +16,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/codex-openai-proxy
+  IMAGE_NAME: ghcr.io/0oastro/codex-openai-proxy
   DEPLOY_DIR: /opt/codex-openai-proxy
 
 jobs:
