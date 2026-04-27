@@ -5,6 +5,7 @@ use tracing::info;
 mod auth;
 mod chat;
 mod config;
+mod images;
 mod models;
 mod proxy;
 
@@ -129,6 +130,14 @@ async fn run_server(port: u16, host: &str, codex_version: Option<String>) -> any
         .route(
             "/v1/chat/completions",
             axum::routing::post(chat::handle_chat_completions),
+        )
+        .route(
+            "/v1/images/generations",
+            axum::routing::post(images::handle_images_generations),
+        )
+        .route(
+            "/v1/images/edits",
+            axum::routing::post(images::handle_images_edits),
         )
         .layer(axum::middleware::from_fn(auth_middleware))
         .with_state(state);
