@@ -433,22 +433,27 @@ fn build_responses_body(req: &ChatRequest) -> Value {
         }
     }
 
-    // Tool choice
+    // Tool choice - only pass through explicit function selection.
+    // The Codex API does not accept {"type":"auto"} etc.
     if let Some(ref tc) = req.tool_choice {
         match tc {
-            Value::String(s) => match s.as_str() {
-                "auto" | "none" | "required" => {
-                    body["tool_choice"] = serde_json::json!({"type": s});
+            Value::String(s) => {
+                // "auto", "none", "required" are OpenAI spec values but Codex
+                // doesn't support them as objects. Omit for auto/required, send
+                // empty tools array for none.
+                if s == "none" {
+                    body["tools"] = Value::Array(vec![]);
                 }
-                _ => {}
-            },
+                // For "auto" / "required" - just omit tool_choice to let Codex decide.
+            }
             Value::Object(obj) => {
                 if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
-                    if let Some(fname) = obj.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
-                        body["tool_choice"] = serde_json::json!({"type": "function", "name": fname});
+                    if let Some(fname) =
+                        obj.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str())
+                    {
+                        body["tool_choice"] =
+                            serde_json::json!({"type": "function", "name": fname});
                     }
-                } else if let Some(_t) = obj.get("type") {
-                    body["tool_choice"] = tc.clone();
                 }
             }
             _ => {}
