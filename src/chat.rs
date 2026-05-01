@@ -23,13 +23,54 @@ pub struct ChatRequest {
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
-    #[allow(dead_code)]
     pub temperature: Option<f64>,
     #[serde(default)]
-    #[allow(dead_code)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
     pub max_tokens: Option<u64>,
     #[serde(default)]
+    pub max_completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub stop: Option<Value>,
+    #[serde(default)]
+    pub n: Option<u64>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
     pub tools: Option<Vec<ToolDef>>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub presence_penalty: Option<f64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub logprobs: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub response_format: Option<Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub seed: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub user: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub service_tier: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,14 +230,14 @@ fn parse_reasoning_suffix(model: &str) -> (String, Option<String>) {
 
 // ── Translation: Chat -> Responses ───────────────────────────────────────
 
-fn translate_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
-    let mut instructions: Option<String> = None;
+fn translate_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+    let mut instruction_parts: Vec<String> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
 
     for msg in messages {
         match msg.role.as_str() {
-            "system" => {
-                instructions = Some(extract_text(&msg.content));
+            "system" | "developer" => {
+                instruction_parts.push(extract_text(&msg.content));
             }
             "user" => {
                 input.push(serde_json::json!({
@@ -216,22 +257,23 @@ fn translate_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) 
                         }));
                     }
                 }
+                if !content_parts.is_empty() {
+                    input.push(serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": content_parts,
+                    }));
+                }
                 if let Some(ref tool_calls) = msg.tool_calls {
                     for tc in tool_calls {
-                        content_parts.push(serde_json::json!({
+                        input.push(serde_json::json!({
                             "type": "function_call",
-                            "id": tc.id,
                             "call_id": tc.id,
                             "name": tc.function.name,
                             "arguments": tc.function.arguments,
                         }));
                     }
                 }
-                input.push(serde_json::json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": content_parts,
-                }));
             }
             "tool" => {
                 input.push(serde_json::json!({
@@ -251,6 +293,7 @@ fn translate_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) 
         }
     }
 
+    let instructions = instruction_parts.join("\n\n");
     (instructions, input)
 }
 
@@ -290,35 +333,82 @@ fn translate_content(content: &Option<Value>, text_type: &str) -> Value {
             let parts: Vec<Value> = arr
                 .iter()
                 .map(|v| {
-                    if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
-                        serde_json::json!({"type": text_type, "text": t})
-                    } else {
-                        v.clone()
+                    let part_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match part_type {
+                        "text" => {
+                            let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                            serde_json::json!({"type": text_type, "text": text})
+                        }
+                        "image_url" => {
+                            let url = v
+                                .get("image_url")
+                                .and_then(|iu| iu.get("url"))
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("");
+                            serde_json::json!({"type": "input_image", "image_url": url})
+                        }
+                        _ => v.clone(),
                     }
                 })
                 .collect();
             Value::Array(parts)
         }
-        Some(v) => Value::Array(vec![serde_json::json!({"type": text_type, "text": v.to_string()})]),
+        Some(v) => Value::Array(vec![
+            serde_json::json!({"type": text_type, "text": v.to_string()}),
+        ]),
     }
 }
 
 fn build_responses_body(req: &ChatRequest) -> Value {
-    let (model_clean, reasoning) = parse_reasoning_suffix(&req.model);
+    let (model_clean, reasoning_from_suffix) = parse_reasoning_suffix(&req.model);
     let (instructions, input) = translate_messages(&req.messages);
 
     let mut body = serde_json::json!({
         "model": model_clean,
+        "instructions": instructions,
         "input": input,
         "stream": req.stream,
         "store": false,
     });
 
-    if let Some(instr) = instructions {
-        body["instructions"] = Value::String(instr);
-    }
-    if let Some(effort) = reasoning {
+    // Reasoning effort: explicit request param takes priority over model suffix.
+    let effort = req
+        .reasoning_effort
+        .as_deref()
+        .or(reasoning_from_suffix.as_deref());
+    if let Some(effort) = effort {
         body["reasoning"] = serde_json::json!({"effort": effort});
+    }
+
+    // Temperature
+    if let Some(t) = req.temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+
+    // Top P
+    if let Some(p) = req.top_p {
+        body["top_p"] = serde_json::json!(p);
+    }
+
+    // Max output tokens: max_completion_tokens takes priority over max_tokens.
+    let max_out = req
+        .max_completion_tokens
+        .or(req.max_tokens);
+    if let Some(m) = max_out {
+        body["max_output_tokens"] = serde_json::json!(m);
+    }
+
+    // Stop sequences
+    if let Some(ref stop) = req.stop {
+        match stop {
+            Value::String(s) => {
+                body["stop"] = serde_json::json!([s]);
+            }
+            Value::Array(arr) => {
+                body["stop"] = Value::Array(arr.clone());
+            }
+            _ => {}
+        }
     }
 
     // Pass through tools if present.
@@ -339,6 +429,33 @@ fn build_responses_body(req: &ChatRequest) -> Value {
         if !codex_tools.is_empty() {
             body["tools"] = Value::Array(codex_tools);
         }
+    }
+
+    // Tool choice
+    if let Some(ref tc) = req.tool_choice {
+        match tc {
+            Value::String(s) => match s.as_str() {
+                "auto" | "none" | "required" => {
+                    body["tool_choice"] = serde_json::json!({"type": s});
+                }
+                _ => {}
+            },
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
+                    if let Some(fname) = obj.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                        body["tool_choice"] = serde_json::json!({"type": "function", "name": fname});
+                    }
+                } else if let Some(_t) = obj.get("type") {
+                    body["tool_choice"] = tc.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Parallel tool calls
+    if let Some(p) = req.parallel_tool_calls {
+        body["parallel_tool_calls"] = serde_json::json!(p);
     }
 
     body
@@ -363,13 +480,28 @@ pub async fn handle_chat_completions(
     };
 
     let stream = req.stream;
+    let stream_include_usage = req
+        .stream_options
+        .as_ref()
+        .and_then(|so| so.include_usage)
+        .unwrap_or(false);
     let resp_id = format!("chatcmpl-{}", uuid_short());
     let model = req.model.clone();
 
     let upstream_body = build_responses_body(&req);
-    debug!("Translated request body: {}", serde_json::to_string_pretty(&upstream_body).unwrap_or_default());
+    debug!(
+        "Translated request body: {}",
+        serde_json::to_string_pretty(&upstream_body).unwrap_or_default()
+    );
 
     let mut auth_headers = build_auth_headers(&auth, &state.codex_user_agent().await);
+    // Always send OpenAI-Beta header for the Responses API.
+    auth_headers.insert(
+        "openai-beta",
+        "responses=experimental"
+            .parse()
+            .expect("valid header value"),
+    );
     for key in &["openai-beta", "openai-organization"] {
         if let Some(val) = headers.get(*key) {
             auth_headers.insert(*key, val.clone());
@@ -405,6 +537,12 @@ pub async fn handle_chat_completions(
                     Ok(refreshed) => {
                         let ua = state.codex_user_agent().await;
                         let mut retry_headers = build_auth_headers(&refreshed, &ua);
+                        retry_headers.insert(
+                            "openai-beta",
+                            "responses=experimental"
+                                .parse()
+                                .expect("valid header value"),
+                        );
                         for key in &["openai-beta", "openai-organization"] {
                             if let Some(val) = headers.get(*key) {
                                 retry_headers.insert(*key, val.clone());
@@ -421,7 +559,8 @@ pub async fn handle_chat_completions(
                         match retry_resp {
                             Ok(r) => {
                                 return if stream {
-                                    handle_streaming(r, &resp_id, &model).await
+                                    handle_streaming(r, &resp_id, &model, stream_include_usage)
+                                        .await
                                 } else {
                                     handle_non_streaming(r, &resp_id, &model).await
                                 };
@@ -455,7 +594,7 @@ pub async fn handle_chat_completions(
     }
 
     if stream {
-        handle_streaming(upstream_resp, &resp_id, &model).await
+        handle_streaming(upstream_resp, &resp_id, &model, stream_include_usage).await
     } else {
         handle_non_streaming(upstream_resp, &resp_id, &model).await
     }
@@ -467,103 +606,205 @@ async fn handle_streaming(
     upstream: reqwest::Response,
     resp_id: &str,
     model: &str,
+    stream_include_usage: bool,
 ) -> Response {
     let resp_id = resp_id.to_string();
     let model = model.to_string();
 
-    let stream = upstream.bytes_stream().map(move |result| {
-        let chunk = match result {
-            Ok(b) => b,
-            Err(e) => {
-                error!("Stream error: {e}");
-                return Ok::<_, std::io::Error>(Bytes::from(format!(
-                    "data: {{\"error\":{{\"message\":\"Stream error: {e}\"}}}}\n\n"
-                )));
-            }
-        };
+    let stream = futures::stream::unfold(
+        (
+            upstream.bytes_stream(),
+            resp_id,
+            model,
+            false,
+            false,
+            false,
+            false,
+            stream_include_usage,
+        ),
+        |(
+            mut upstream_stream,
+            resp_id,
+            model,
+            mut saw_completed,
+            mut sent_eof_done,
+            mut saw_tool_call,
+            mut saw_function_arg_delta,
+            stream_include_usage,
+        )| async move {
+            loop {
+                let Some(result) = upstream_stream.next().await else {
+                    if saw_completed || sent_eof_done {
+                        return None;
+                    }
 
-        let raw = String::from_utf8_lossy(&chunk);
-        let mut output = String::new();
+                    sent_eof_done = true;
+                    let finish_reason = if saw_tool_call { "tool_calls" } else { "stop" };
+                    let output = final_stream_chunk(&resp_id, &model, None, finish_reason, stream_include_usage);
+                    return Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from(output)),
+                        (
+                            upstream_stream,
+                            resp_id,
+                            model,
+                            saw_completed,
+                            sent_eof_done,
+                            saw_tool_call,
+                            saw_function_arg_delta,
+                            stream_include_usage,
+                        ),
+                    ));
+                };
 
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    output.push_str("data: [DONE]\n\n");
-                    continue;
-                }
-
-                let event: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
+                let chunk = match result {
+                    Ok(b) => b,
                     Err(e) => {
-                        debug!("Failed to parse SSE event: {e}");
-                        continue;
+                        error!("Stream error: {e}");
+                        return Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from(format!(
+                                "data: {{\"error\":{{\"message\":\"Stream error: {e}\"}}}}\n\n"
+                            ))),
+                            (
+                                upstream_stream,
+                                resp_id,
+                                model,
+                                saw_completed,
+                                true,
+                                saw_tool_call,
+                                saw_function_arg_delta,
+                                stream_include_usage,
+                            ),
+                        ));
                     }
                 };
 
-                let event_type = event["type"].as_str().unwrap_or("");
+                let translation = translate_stream_chunk(
+                    &chunk,
+                    &resp_id,
+                    &model,
+                    saw_tool_call,
+                    saw_function_arg_delta,
+                    stream_include_usage,
+                );
+                saw_completed |= translation.completed;
+                saw_tool_call |= translation.saw_tool_call;
+                saw_function_arg_delta |= translation.saw_function_arg_delta;
+                let output = translation.output;
+                if output.is_empty() {
+                    continue;
+                }
 
-                match event_type {
-                    "response.created" => {
+                return Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from(output)),
+                    (
+                        upstream_stream,
+                        resp_id,
+                        model,
+                        saw_completed,
+                        sent_eof_done,
+                        saw_tool_call,
+                        saw_function_arg_delta,
+                        stream_include_usage,
+                    ),
+                ));
+            }
+        },
+    );
+
+    let body = Body::from_stream(stream);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(body)
+        .unwrap()
+}
+
+struct StreamTranslation {
+    output: String,
+    completed: bool,
+    saw_tool_call: bool,
+    saw_function_arg_delta: bool,
+}
+
+fn translate_stream_chunk(
+    chunk: &[u8],
+    resp_id: &str,
+    model: &str,
+    saw_tool_call_before: bool,
+    saw_function_arg_delta_before: bool,
+    stream_include_usage: bool,
+) -> StreamTranslation {
+    let raw = String::from_utf8_lossy(chunk);
+    let mut output = String::new();
+    let mut completed = false;
+    let mut saw_tool_call = false;
+    let mut saw_function_arg_delta = false;
+    let mut tool_call_seen = saw_tool_call_before;
+    let mut arg_delta_seen = saw_function_arg_delta_before;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data == "[DONE]" {
+                completed = true;
+                output.push_str("data: [DONE]\n\n");
+                continue;
+            }
+
+            let event: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!("Failed to parse SSE event: {e}");
+                    continue;
+                }
+            };
+
+            let event_type = event["type"].as_str().unwrap_or("");
+
+            match event_type {
+                "response.created" => {
+                    let chunk = ChatCompletionChunk {
+                        id: resp_id.to_string(),
+                        object: "chat.completion.chunk",
+                        created: now_epoch(),
+                        model: model.to_string(),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: Delta {
+                                role: Some("assistant".into()),
+                                content: None,
+                                tool_calls: None,
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    };
+                    output.push_str(&format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ));
+                }
+                "response.output_item.added" => {
+                    let item = &event["item"];
+                    if item["type"].as_str() == Some("function_call") {
+                        saw_tool_call = true;
+                        tool_call_seen = true;
+                        let fname = item["name"].as_str().unwrap_or("");
+                        let fid = item
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| item["id"].as_str())
+                            .unwrap_or("");
                         let chunk = ChatCompletionChunk {
-                            id: resp_id.clone(),
+                            id: resp_id.to_string(),
                             object: "chat.completion.chunk",
                             created: now_epoch(),
-                            model: model.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: Some("assistant".into()),
-                                    content: None,
-                                    tool_calls: None,
-                                },
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                        };
-                        output.push_str(&format!(
-                            "data: {}\n\n",
-                            serde_json::to_string(&chunk).unwrap_or_default()
-                        ));
-                    }
-                    "response.output_item.added" => {
-                        // Could signal start of a new content block.
-                        // Nothing needed in OpenAI format — text follows via deltas.
-                    }
-                    "response.output_text.delta" => {
-                        let text = event["delta"].as_str().unwrap_or("");
-                        let chunk = ChatCompletionChunk {
-                            id: resp_id.clone(),
-                            object: "chat.completion.chunk",
-                            created: now_epoch(),
-                            model: model.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: None,
-                                    content: Some(text.to_string()),
-                                    tool_calls: None,
-                                },
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                        };
-                        output.push_str(&format!(
-                            "data: {}\n\n",
-                            serde_json::to_string(&chunk).unwrap_or_default()
-                        ));
-                    }
-                    "response.function_call_arguments.delta" => {
-                        let delta_args = event["delta"].as_str().unwrap_or("");
-                        let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-                        let chunk = ChatCompletionChunk {
-                            id: resp_id.clone(),
-                            object: "chat.completion.chunk",
-                            created: now_epoch(),
-                            model: model.clone(),
+                            model: model.to_string(),
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: Delta {
@@ -571,11 +812,11 @@ async fn handle_streaming(
                                     content: None,
                                     tool_calls: Some(vec![DeltaToolCall {
                                         index: 0,
-                                        id: if delta_args.is_empty() { Some(item_id.to_string()) } else { None },
+                                        id: Some(fid.to_string()),
                                         call_type: Some("function".into()),
                                         function: Some(DeltaFunction {
-                                            name: None,
-                                            arguments: Some(delta_args.to_string()),
+                                            name: Some(fname.to_string()),
+                                            arguments: Some(String::new()),
                                         }),
                                     }]),
                                 },
@@ -588,102 +829,194 @@ async fn handle_streaming(
                             serde_json::to_string(&chunk).unwrap_or_default()
                         ));
                     }
-                    "response.output_item.done" => {
-                        // A function call item finished — check if it's a function_call
-                        let item = &event["item"];
-                        if item["type"].as_str() == Some("function_call") {
-                            let fname = item["name"].as_str().unwrap_or("");
-                            let fid = item["id"].as_str().unwrap_or("");
-                            let fargs = item["arguments"].as_str().unwrap_or("");
-                            let chunk = ChatCompletionChunk {
-                                id: resp_id.clone(),
-                                object: "chat.completion.chunk",
-                                created: now_epoch(),
-                                model: model.clone(),
-                                choices: vec![ChunkChoice {
+                }
+                "response.output_text.delta" => {
+                    let text = event["delta"].as_str().unwrap_or("");
+                    let chunk = ChatCompletionChunk {
+                        id: resp_id.to_string(),
+                        object: "chat.completion.chunk",
+                        created: now_epoch(),
+                        model: model.to_string(),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: Delta {
+                                role: None,
+                                content: Some(text.to_string()),
+                                tool_calls: None,
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    };
+                    output.push_str(&format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ));
+                }
+                "response.function_call_arguments.delta" => {
+                    saw_tool_call = true;
+                    tool_call_seen = true;
+                    saw_function_arg_delta = true;
+                    arg_delta_seen = true;
+                    let delta_args = event["delta"].as_str().unwrap_or("");
+                    let chunk = ChatCompletionChunk {
+                        id: resp_id.to_string(),
+                        object: "chat.completion.chunk",
+                        created: now_epoch(),
+                        model: model.to_string(),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: Delta {
+                                role: None,
+                                content: None,
+                                tool_calls: Some(vec![DeltaToolCall {
                                     index: 0,
-                                    delta: Delta {
-                                        role: None,
-                                        content: None,
-                                        tool_calls: Some(vec![DeltaToolCall {
-                                            index: 0,
-                                            id: Some(fid.to_string()),
-                                            call_type: Some("function".into()),
-                                            function: Some(DeltaFunction {
-                                                name: Some(fname.to_string()),
-                                                arguments: Some(fargs.to_string()),
-                                            }),
-                                        }]),
-                                    },
-                                    finish_reason: None,
-                                }],
-                                usage: None,
-                            };
-                            output.push_str(&format!(
-                                "data: {}\n\n",
-                                serde_json::to_string(&chunk).unwrap_or_default()
-                            ));
+                                    id: None,
+                                    call_type: Some("function".into()),
+                                    function: Some(DeltaFunction {
+                                        name: None,
+                                        arguments: Some(delta_args.to_string()),
+                                    }),
+                                }]),
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    };
+                    output.push_str(&format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ));
+                }
+                "response.output_item.done" => {
+                    // A function call item finished — check if it's a function_call
+                    let item = &event["item"];
+                    if item["type"].as_str() == Some("function_call") {
+                        saw_tool_call = true;
+                        tool_call_seen = true;
+                        if arg_delta_seen {
+                            continue;
                         }
-                    }
-                    "response.completed" => {
-                        let mut usage = Usage {
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
-                            total_tokens: 0,
-                        };
-                        if let Some(u) = event.get("response").and_then(|r| r.get("usage")) {
-                            usage.prompt_tokens =
-                                u["input_tokens"].as_u64().unwrap_or(0);
-                            usage.completion_tokens =
-                                u["output_tokens"].as_u64().unwrap_or(0);
-                            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-                        }
+                        let fname = item["name"].as_str().unwrap_or("");
+                        let fid = item
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| item["id"].as_str())
+                            .unwrap_or("");
+                        let fargs = item["arguments"].as_str().unwrap_or("");
                         let chunk = ChatCompletionChunk {
-                            id: resp_id.clone(),
+                            id: resp_id.to_string(),
                             object: "chat.completion.chunk",
                             created: now_epoch(),
-                            model: model.clone(),
+                            model: model.to_string(),
                             choices: vec![ChunkChoice {
                                 index: 0,
-                                delta: Delta::default(),
-                                finish_reason: Some("stop".into()),
+                                delta: Delta {
+                                    role: None,
+                                    content: None,
+                                    tool_calls: Some(vec![DeltaToolCall {
+                                        index: 0,
+                                        id: Some(fid.to_string()),
+                                        call_type: Some("function".into()),
+                                        function: Some(DeltaFunction {
+                                            name: Some(fname.to_string()),
+                                            arguments: Some(fargs.to_string()),
+                                        }),
+                                    }]),
+                                },
+                                finish_reason: None,
                             }],
-                            usage: Some(usage),
+                            usage: None,
                         };
                         output.push_str(&format!(
                             "data: {}\n\n",
                             serde_json::to_string(&chunk).unwrap_or_default()
                         ));
-                        output.push_str("data: [DONE]\n\n");
                     }
-                    _ => {
-                        // Forward unknown events as-is (helps debugging).
-                        debug!("Unhandled SSE event type: {event_type}");
-                    }
+                }
+                "response.completed" => {
+                    completed = true;
+                    let usage = event.get("response").and_then(|r| r.get("usage"));
+                    let finish_reason = if tool_call_seen { "tool_calls" } else { "stop" };
+                    output.push_str(&final_stream_chunk(resp_id, model, usage, finish_reason, stream_include_usage));
+                }
+                "response.incomplete" => {
+                    completed = true;
+                    let usage = event.get("response").and_then(|r| r.get("usage"));
+                    output.push_str(&final_stream_chunk(resp_id, model, usage, "length", stream_include_usage));
+                }
+                _ => {
+                    // Forward unknown events as-is (helps debugging).
+                    debug!("Unhandled SSE event type: {event_type}");
                 }
             }
         }
+    }
 
-        Ok(Bytes::from(output))
+    StreamTranslation {
+        output,
+        completed,
+        saw_tool_call,
+        saw_function_arg_delta,
+    }
+}
+
+fn final_stream_chunk(
+    resp_id: &str,
+    model: &str,
+    usage: Option<&Value>,
+    finish_reason: &str,
+    stream_include_usage: bool,
+) -> String {
+    let usage_obj = usage.map(|u| {
+        let prompt_tokens = u["input_tokens"].as_u64().unwrap_or(0);
+        let completion_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+        Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }
     });
 
-    let body = Body::from_stream(stream);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "keep-alive")
-        .body(body)
-        .unwrap()
+    let finish_chunk = ChatCompletionChunk {
+        id: resp_id.to_string(),
+        object: "chat.completion.chunk",
+        created: now_epoch(),
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta::default(),
+            finish_reason: Some(finish_reason.into()),
+        }],
+        usage: None,
+    };
+
+    // If stream_options.include_usage is true, emit a separate final chunk with usage.
+    if stream_include_usage {
+        let usage_chunk = ChatCompletionChunk {
+            id: resp_id.to_string(),
+            object: "chat.completion.chunk",
+            created: now_epoch(),
+            model: model.to_string(),
+            choices: vec![],
+            usage: usage_obj,
+        };
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&finish_chunk).unwrap_or_default(),
+            serde_json::to_string(&usage_chunk).unwrap_or_default(),
+        )
+    } else {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&finish_chunk).unwrap_or_default(),
+        )
+    }
 }
 
 // ── Non-streaming translation ─────────────────────────────────────────────
 
-async fn handle_non_streaming(
-    upstream: reqwest::Response,
-    resp_id: &str,
-    model: &str,
-) -> Response {
+async fn handle_non_streaming(upstream: reqwest::Response, resp_id: &str, model: &str) -> Response {
     let body: Value = match upstream.json().await {
         Ok(v) => v,
         Err(e) => {
@@ -696,13 +1029,20 @@ async fn handle_non_streaming(
         }
     };
 
-    debug!("Non-streaming upstream response: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+    debug!(
+        "Non-streaming upstream response: {}",
+        serde_json::to_string_pretty(&body).unwrap_or_default()
+    );
 
     let mut content_text = String::new();
     let mut tool_calls_resp: Vec<ToolCallResponse> = Vec::new();
 
     // Extract output items.
-    let output = body.get("output").and_then(|o| o.as_array()).cloned().unwrap_or_default();
+    let output = body
+        .get("output")
+        .and_then(|o| o.as_array())
+        .cloned()
+        .unwrap_or_default();
     for item in &output {
         let item_type = item["type"].as_str().unwrap_or("");
         match item_type {
@@ -757,7 +1097,7 @@ async fn handle_non_streaming(
             index: 0,
             message: ResponseMessage {
                 role: "assistant".into(),
-                content: if content_text.is_empty() && !tool_calls_resp.is_empty() {
+                content: if content_text.is_empty() {
                     None
                 } else {
                     Some(content_text)
@@ -779,9 +1119,8 @@ async fn handle_non_streaming(
 // ── helpers ───────────────────────────────────────────────────────────────
 
 async fn load_and_refresh_auth() -> Result<crate::auth::AuthTokens, String> {
-    let tokens = crate::auth::AuthTokens::load().ok_or_else(|| {
-        "Not authenticated. Run `codex-openai-proxy login`.".to_string()
-    })?;
+    let tokens = crate::auth::AuthTokens::load()
+        .ok_or_else(|| "Not authenticated. Run `codex-openai-proxy login`.".to_string())?;
     crate::auth::ensure_valid_token(tokens)
         .await
         .map_err(|e: anyhow::Error| e.to_string())
@@ -798,4 +1137,126 @@ fn now_epoch() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(messages: Vec<ChatMessage>) -> ChatRequest {
+        ChatRequest {
+            model: "gpt-5.5".to_string(),
+            messages,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            stop: None,
+            n: None,
+            stream_options: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning_effort: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logprobs: None,
+            response_format: None,
+            seed: None,
+            user: None,
+            service_tier: None,
+        }
+    }
+
+    fn message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: Some(Value::String(content.to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn assistant_tool_call_message(content: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: content.map(|s| Value::String(s.to_string())),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_123".to_string(),
+                call_type: Some("function".to_string()),
+                function: FunctionCall {
+                    name: "lookup".to_string(),
+                    arguments: r#"{"query":"status"}"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn chat_translation_always_includes_instructions() {
+        let body = build_responses_body(&request(vec![message("user", "hello")]));
+
+        assert_eq!(body["instructions"], Value::String(String::new()));
+        assert_eq!(body["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn chat_translation_uses_system_message_as_instructions() {
+        let body = build_responses_body(&request(vec![
+            message("system", "be direct"),
+            message("user", "hello"),
+        ]));
+
+        assert_eq!(body["instructions"], "be direct");
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chat_translation_uses_developer_message_as_instructions() {
+        let body = build_responses_body(&request(vec![
+            message("developer", "follow the repo instructions"),
+            message("user", "hello"),
+        ]));
+
+        assert_eq!(body["instructions"], "follow the repo instructions");
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn chat_translation_puts_assistant_tool_calls_at_top_level() {
+        let body = build_responses_body(&request(vec![
+            message("user", "check status"),
+            assistant_tool_call_message(Some("I will check.")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some(Value::String(r#"{"status":"ok"}"#.to_string())),
+                tool_calls: None,
+                tool_call_id: Some("call_123".to_string()),
+                name: None,
+            },
+        ]));
+
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][2]["type"], "function_call");
+        assert_eq!(body["input"][2]["call_id"], "call_123");
+        assert!(body["input"][2].get("content").is_none());
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn chat_translation_omits_empty_assistant_message_for_tool_only_turn() {
+        let body = build_responses_body(&request(vec![
+            message("user", "check status"),
+            assistant_tool_call_message(None),
+        ]));
+
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+        assert_eq!(body["input"][1]["type"], "function_call");
+    }
 }

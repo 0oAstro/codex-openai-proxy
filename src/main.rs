@@ -110,6 +110,23 @@ async fn auth_middleware(
     }
 }
 
+/// CORS middleware. Handles OPTIONS preflight and adds CORS headers to all responses.
+async fn cors_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::header;
+
+    if req.method() == axum::http::Method::OPTIONS {
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    }
+
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+    resp
+}
+
 async fn run_server(port: u16, host: &str, codex_version: Option<String>) -> anyhow::Result<()> {
     let state = config::make_state(port, codex_version).await;
     config::spawn_version_refresher(state.clone());
@@ -139,6 +156,7 @@ async fn run_server(port: u16, host: &str, codex_version: Option<String>) -> any
             "/v1/images/edits",
             axum::routing::post(images::handle_images_edits),
         )
+        .layer(axum::middleware::from_fn(cors_middleware))
         .layer(axum::middleware::from_fn(auth_middleware))
         .with_state(state);
 

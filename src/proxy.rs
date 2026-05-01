@@ -5,6 +5,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
+use serde_json::Value;
 use tracing::{debug, error, info};
 
 use crate::config::AppState;
@@ -19,6 +20,8 @@ pub async fn handle_responses(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let (upstream_body, stream_requested) = sanitize_responses_body(&body);
+
     let auth = match load_and_refresh_auth().await {
         Ok(a) => a,
         Err(e) => {
@@ -31,7 +34,14 @@ pub async fn handle_responses(
     };
 
     let mut auth_headers = build_auth_headers(&auth, &state.codex_user_agent().await);
-    // Copy selected headers from the incoming request (e.g. OpenAI-Beta).
+    // Always send OpenAI-Beta header for the Responses API.
+    auth_headers.insert(
+        "openai-beta",
+        "responses=experimental"
+            .parse()
+            .expect("valid header value"),
+    );
+    // Copy selected headers from the incoming request (e.g. OpenAI-Beta, OpenAI-Organization).
     for key in &["openai-beta", "openai-organization"] {
         if let Some(val) = headers.get(*key) {
             auth_headers.insert(*key, val.clone());
@@ -45,7 +55,7 @@ pub async fn handle_responses(
         .http
         .post(&url)
         .headers(auth_headers.clone())
-        .body(body.to_vec())
+        .body(upstream_body.clone())
         .send()
         .await
     {
@@ -72,6 +82,12 @@ pub async fn handle_responses(
                     Ok(refreshed) => {
                         let ua = state.codex_user_agent().await;
                         let mut retry_headers = build_auth_headers(&refreshed, &ua);
+                        retry_headers.insert(
+                            "openai-beta",
+                            "responses=experimental"
+                                .parse()
+                                .expect("valid header value"),
+                        );
                         for key in &["openai-beta", "openai-organization"] {
                             if let Some(val) = headers.get(*key) {
                                 retry_headers.insert(*key, val.clone());
@@ -82,7 +98,7 @@ pub async fn handle_responses(
                             .http
                             .post(&url)
                             .headers(retry_headers)
-                            .body(body.to_vec())
+                            .body(upstream_body.clone())
                             .send()
                             .await
                         {
@@ -96,7 +112,7 @@ pub async fn handle_responses(
                             }
                         };
 
-                        return stream_response(retry_resp).await;
+                        return stream_response(retry_resp, stream_requested).await;
                     }
                     Err(e) => {
                         error!("Token refresh failed: {e}");
@@ -106,26 +122,31 @@ pub async fn handle_responses(
         }
     }
 
-    stream_response(resp).await
+    stream_response(resp, stream_requested).await
 }
 
 /// Stream an upstream response back to the client, proxying the status code
 /// and content-type, and forwarding the body as-is (SSE byte stream).
-async fn stream_response(upstream: reqwest::Response) -> Response {
+async fn stream_response(upstream: reqwest::Response, stream_requested: bool) -> Response {
     let status = upstream.status();
     let content_type = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .cloned();
 
-    let stream = upstream.bytes_stream().map(|result| {
-        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-    });
+    let stream = upstream
+        .bytes_stream()
+        .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
     let body = Body::from_stream(stream);
 
     let mut builder = Response::builder().status(status);
     if let Some(ct) = content_type {
         builder = builder.header(reqwest::header::CONTENT_TYPE, ct);
+    } else if stream_requested {
+        // Bifrost requires SSE content-type for /responses stream passthrough.
+        builder = builder.header(reqwest::header::CONTENT_TYPE, "text/event-stream");
+    } else {
+        builder = builder.header(reqwest::header::CONTENT_TYPE, "application/json");
     }
     match builder.body(body) {
         Ok(resp) => resp,
@@ -139,11 +160,75 @@ async fn stream_response(upstream: reqwest::Response) -> Response {
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
+/// Codex upstream does not support OpenAI `safety_identifier`; drop it while
+/// preserving all other request fields verbatim. Also ensures `instructions`
+/// and `store` fields have sane defaults.
+fn sanitize_responses_body(body: &[u8]) -> (Vec<u8>, bool) {
+    let mut parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return (body.to_vec(), false),
+    };
+
+    let stream_requested = parsed
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.remove("safety_identifier");
+        obj.entry("instructions")
+            .or_insert_with(|| Value::String(String::new()));
+        if !obj.contains_key("store") {
+            obj.insert("store".to_string(), Value::Bool(false));
+        }
+    }
+
+    (
+        serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec()),
+        stream_requested,
+    )
+}
+
 async fn load_and_refresh_auth() -> Result<crate::auth::AuthTokens, String> {
-    let tokens = crate::auth::AuthTokens::load().ok_or_else(|| {
-        "Not authenticated. Run `codex-openai-proxy login`.".to_string()
-    })?;
+    let tokens = crate::auth::AuthTokens::load()
+        .ok_or_else(|| "Not authenticated. Run `codex-openai-proxy login`.".to_string())?;
     crate::auth::ensure_valid_token(tokens)
         .await
         .map_err(|e: anyhow::Error| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_responses_body_adds_required_instructions_and_store() {
+        let (body, stream_requested) = sanitize_responses_body(
+            br#"{"model":"gpt-5.5","input":[],"stream":true,"safety_identifier":"sid"}"#,
+        );
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(stream_requested);
+        assert_eq!(parsed["instructions"], Value::String(String::new()));
+        assert!(parsed.get("safety_identifier").is_none());
+        assert_eq!(parsed["store"], false);
+    }
+
+    #[test]
+    fn sanitize_responses_body_preserves_existing_instructions() {
+        let (body, _) =
+            sanitize_responses_body(br#"{"model":"gpt-5.5","instructions":"be direct"}"#);
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["instructions"], "be direct");
+    }
+
+    #[test]
+    fn sanitize_responses_body_preserves_existing_store() {
+        let (body, _) =
+            sanitize_responses_body(br#"{"model":"gpt-5.5","store":true}"#);
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["store"], true);
+    }
 }
