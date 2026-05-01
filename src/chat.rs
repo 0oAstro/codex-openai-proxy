@@ -367,7 +367,9 @@ fn build_responses_body(req: &ChatRequest) -> Value {
         "model": model_clean,
         "instructions": instructions,
         "input": input,
-        "stream": req.stream,
+        // Always stream from upstream (Codex requires it). For non-streaming
+        // client requests, we collect the SSE into a single response.
+        "stream": true,
         "store": false,
     });
 
@@ -1016,77 +1018,122 @@ fn final_stream_chunk(
 
 // ── Non-streaming translation ─────────────────────────────────────────────
 
+/// Collect the SSE stream from upstream into a single chat completion response.
 async fn handle_non_streaming(upstream: reqwest::Response, resp_id: &str, model: &str) -> Response {
-    let body: Value = match upstream.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Failed to parse upstream response: {e}");
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": {"message": format!("Bad upstream response: {e}")}})),
-            )
-                .into_response();
-        }
-    };
+    let status = upstream.status();
+    if !status.is_success() {
+        let body = upstream.text().await.unwrap_or_default();
+        error!("Upstream error ({status}): {body}");
+        return (
+            status,
+            Json(serde_json::json!({"error": {"message": body}})),
+        )
+            .into_response();
+    }
 
-    debug!(
-        "Non-streaming upstream response: {}",
-        serde_json::to_string_pretty(&body).unwrap_or_default()
-    );
+    let raw = upstream.bytes().await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&raw);
 
     let mut content_text = String::new();
     let mut tool_calls_resp: Vec<ToolCallResponse> = Vec::new();
+    let mut usage: Option<Usage> = None;
+    let mut finish_reason = "stop".to_string();
 
-    // Extract output items.
-    let output = body
-        .get("output")
-        .and_then(|o| o.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for item in &output {
-        let item_type = item["type"].as_str().unwrap_or("");
-        match item_type {
-            "message" => {
-                if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
-                    for part in parts {
-                        if part["type"].as_str() == Some("output_text") {
-                            if let Some(text) = part["text"].as_str() {
-                                content_text.push_str(text);
-                            }
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+
+        let event: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let event_type = event["type"].as_str().unwrap_or("");
+
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(delta) = event["delta"].as_str() {
+                    content_text.push_str(delta);
+                }
+            }
+            "response.output_item.added" => {
+                let item = &event["item"];
+                if item["type"].as_str() == Some("function_call") {
+                    let id = item
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item["id"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item["name"].as_str().unwrap_or("").to_string();
+                    tool_calls_resp.push(ToolCallResponse {
+                        id,
+                        call_type: "function".into(),
+                        function: FunctionResponse {
+                            name,
+                            arguments: String::new(),
+                        },
+                    });
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let Some(tc) = tool_calls_resp.last_mut() {
+                    if let Some(delta) = event["delta"].as_str() {
+                        tc.function.arguments.push_str(delta);
+                    }
+                }
+            }
+            "response.output_item.done" => {
+                let item = &event["item"];
+                if item["type"].as_str() == Some("function_call") {
+                    let id = item
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item["id"].as_str())
+                        .unwrap_or("");
+                    // If we already have partial args from deltas, keep them.
+                    // Otherwise use the full args from this done event.
+                    if let Some(tc) = tool_calls_resp.iter_mut().find(|t| t.id == id) {
+                        if tc.function.arguments.is_empty() {
+                            tc.function.arguments =
+                                item["arguments"].as_str().unwrap_or("").to_string();
                         }
                     }
                 }
             }
-            "function_call" => {
-                tool_calls_resp.push(ToolCallResponse {
-                    id: item["id"].as_str().unwrap_or("").to_string(),
-                    call_type: "function".into(),
-                    function: FunctionResponse {
-                        name: item["name"].as_str().unwrap_or("").to_string(),
-                        arguments: item["arguments"].as_str().unwrap_or("{}").to_string(),
-                    },
-                });
+            "response.completed" => {
+                if let Some(resp) = event.get("response") {
+                    if let Some(u) = resp.get("usage") {
+                        let prompt_tokens = u["input_tokens"].as_u64().unwrap_or(0);
+                        let completion_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+                        usage = Some(Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens: prompt_tokens + completion_tokens,
+                        });
+                    }
+                }
+                finish_reason = if !tool_calls_resp.is_empty() {
+                    "tool_calls".to_string()
+                } else {
+                    "stop".to_string()
+                };
+            }
+            "response.incomplete" => {
+                finish_reason = "length".to_string();
             }
             _ => {}
         }
     }
-
-    let mut usage = Usage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-    };
-    if let Some(u) = body.get("usage") {
-        usage.prompt_tokens = u["input_tokens"].as_u64().unwrap_or(0);
-        usage.completion_tokens = u["output_tokens"].as_u64().unwrap_or(0);
-        usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-    }
-
-    let finish_reason = if !tool_calls_resp.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
 
     let response = ChatCompletionResponse {
         id: resp_id.to_string(),
@@ -1108,9 +1155,13 @@ async fn handle_non_streaming(upstream: reqwest::Response, resp_id: &str, model:
                     Some(tool_calls_resp)
                 },
             },
-            finish_reason: finish_reason.to_string(),
+            finish_reason,
         }],
-        usage,
+        usage: usage.unwrap_or(Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        }),
     };
 
     Json(response).into_response()

@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use futures::stream::StreamExt;
 use serde_json::Value;
 use tracing::{debug, error, info};
@@ -129,6 +130,13 @@ pub async fn handle_responses(
 /// and content-type, and forwarding the body as-is (SSE byte stream).
 async fn stream_response(upstream: reqwest::Response, stream_requested: bool) -> Response {
     let status = upstream.status();
+
+    if !stream_requested {
+        // Client wants a non-streaming response, but upstream always streams.
+        // Collect the SSE into a single JSON response.
+        return collect_sse_to_json(upstream, status).await;
+    }
+
     let content_type = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -142,11 +150,8 @@ async fn stream_response(upstream: reqwest::Response, stream_requested: bool) ->
     let mut builder = Response::builder().status(status);
     if let Some(ct) = content_type {
         builder = builder.header(reqwest::header::CONTENT_TYPE, ct);
-    } else if stream_requested {
-        // Bifrost requires SSE content-type for /responses stream passthrough.
-        builder = builder.header(reqwest::header::CONTENT_TYPE, "text/event-stream");
     } else {
-        builder = builder.header(reqwest::header::CONTENT_TYPE, "application/json");
+        builder = builder.header(reqwest::header::CONTENT_TYPE, "text/event-stream");
     }
     match builder.body(body) {
         Ok(resp) => resp,
@@ -158,11 +163,78 @@ async fn stream_response(upstream: reqwest::Response, stream_requested: bool) ->
     }
 }
 
+/// Collect an SSE stream from upstream into a single JSON response.
+/// This is used when the client requested a non-streaming response but
+/// upstream always streams.
+async fn collect_sse_to_json(upstream: reqwest::Response, status: StatusCode) -> Response {
+    let raw = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to read upstream SSE body: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": {"message": format!("Failed to read upstream: {e}")}})),
+            )
+                .into_response();
+        }
+    };
+
+    let text = String::from_utf8_lossy(&raw);
+    let mut last_response: Option<Value> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+
+        let event: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Track the latest `response` object from any event that carries it.
+        if let Some(resp) = event.get("response").cloned() {
+            last_response = Some(resp);
+        }
+    }
+
+    match last_response {
+        Some(resp) => {
+            let mut builder = Response::builder().status(status);
+            builder = builder.header(reqwest::header::CONTENT_TYPE, "application/json");
+            match builder.body(axum::body::Body::from(
+                serde_json::to_vec(&resp).unwrap_or_default(),
+            )) {
+                Ok(r) => r,
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to build response: {e}"),
+                )
+                    .into_response(),
+            }
+        }
+        None => (
+            status,
+            Json(serde_json::json!({"error": {"message": "Upstream did not return a response"}})),
+        )
+            .into_response(),
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────
 
 /// Codex upstream does not support OpenAI `safety_identifier`; drop it while
 /// preserving all other request fields verbatim. Also ensures `instructions`
-/// and `store` fields have sane defaults.
+/// and `store` fields have sane defaults, and always forces `stream: true`
+/// since the Codex API requires streaming.
 fn sanitize_responses_body(body: &[u8]) -> (Vec<u8>, bool) {
     let mut parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -181,6 +253,9 @@ fn sanitize_responses_body(body: &[u8]) -> (Vec<u8>, bool) {
         if !obj.contains_key("store") {
             obj.insert("store".to_string(), Value::Bool(false));
         }
+        // Always force stream on for upstream (Codex requires it).
+        // For non-streaming clients, the SSE is collected.
+        obj.insert("stream".to_string(), Value::Bool(true));
     }
 
     (
