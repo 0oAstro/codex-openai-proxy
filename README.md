@@ -118,6 +118,12 @@ for chunk in response:
         print(chunk.choices[0].delta.content, end="")
 ```
 
+## Limitations
+
+- **No WebSocket transport**: The Codex CLI supports a WebSocket mode at `wss://chatgpt.com/backend-api/codex/responses` for persistent connections with `previous_response_id` chaining (~40% faster for 20+ tool-call chains). This proxy only supports HTTP/SSE. Adding WebSocket would require `tokio-tungstenite`, in-memory response state, and the `response.create` event protocol. Note that HTTP gateway proxies (e.g. Bifrost) cannot route WebSocket connections anyway, so this would only benefit direct-to-proxy clients.
+- **Stateless**: Each request is independent. `previous_response_id` and `item_reference` are not supported -- clients must send the full conversation history each turn.
+- **No image endpoint streaming via Bifrost**: Image generation/edit streaming uses custom SSE event types that may not be forwarded by all HTTP gateways.
+
 ## License
 
 MIT
