@@ -5,6 +5,7 @@ Proxy your ChatGPT/Codex subscription as an OpenAI-compatible API.
 ## Features
 
 - **OpenAI-compatible endpoints**: `/v1/models`, `/v1/responses`, `/v1/chat/completions`
+- **Usage metrics**: `/usage` returns Codex rate-limit and credit snapshots
 - **OAuth PKCE login**: browser-based authentication with automatic token refresh
 - **Streaming support**: SSE streaming for both responses and chat completions
 - **Chat completions translation**: translates OpenAI chat format to/from Codex Responses API
@@ -60,7 +61,7 @@ codex-openai-proxy auth status
 codex-openai-proxy logout
 ```
 
-Credentials are stored in `~/auth.json`.
+Credentials are stored in `~/auth.json` by default. Set `CODEX_AUTH_FILE` to use a different path.
 
 ## API Endpoints
 
@@ -69,6 +70,9 @@ Returns `{"status": "ok"}`.
 
 ### `GET /v1/models`
 Returns available models in OpenAI format. Cached for 5 minutes.
+
+### `GET /usage`
+Returns Codex usage metrics parsed from the upstream rate-limit headers/events.
 
 ### `POST /v1/responses`
 Passthrough to the Codex Responses API. Streams SSE response back verbatim.

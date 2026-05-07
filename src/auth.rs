@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
 use crate::config::{
-    AUTH_FILE, AUTH_URL, CLIENT_ID, REDIRECT_URI, REFRESH_MARGIN_SECS, REVOKE_URL, SCOPES,
+    auth_file_path, AUTH_URL, CLIENT_ID, REDIRECT_URI, REFRESH_MARGIN_SECS, REVOKE_URL, SCOPES,
     TOKEN_URL,
 };
 
@@ -30,10 +30,9 @@ pub struct AuthTokens {
 }
 
 impl AuthTokens {
-    /// Return the auth file path (`~/auth.json`).
+    /// Return the auth file path.
     pub fn path() -> PathBuf {
-        let home = dirs_home();
-        home.join(AUTH_FILE)
+        auth_file_path()
     }
 
     /// Load tokens from disk. Returns `None` if the file does not exist.
@@ -43,7 +42,7 @@ impl AuthTokens {
             return None;
         }
         match fs::read_to_string(&p) {
-            Ok(data) => serde_json::from_str(&data).ok(),
+            Ok(data) => parse_auth_tokens(&data).ok(),
             Err(e) => {
                 error!("Failed to read auth file: {e}");
                 None
@@ -57,6 +56,28 @@ impl AuthTokens {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
         }
+
+        if let Ok(existing) = fs::read_to_string(&p) {
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&existing) {
+                if value.get("tokens").is_some() {
+                    value["tokens"]["access_token"] =
+                        serde_json::Value::String(self.access_token.clone());
+                    value["tokens"]["refresh_token"] =
+                        serde_json::Value::String(self.refresh_token.clone().unwrap_or_default());
+                    if let Some(id_token) = self.id_token.as_ref() {
+                        value["tokens"]["id_token"] = serde_json::json!({"raw_jwt": id_token});
+                    }
+                    if let Some(account_id) = self.account_id.as_ref() {
+                        value["tokens"]["account_id"] =
+                            serde_json::Value::String(account_id.clone());
+                    }
+                    value["last_refresh"] = serde_json::Value::String(Utc::now().to_rfc3339());
+                    fs::write(&p, serde_json::to_string_pretty(&value)?)?;
+                    return Ok(());
+                }
+            }
+        }
+
         fs::write(&p, serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
@@ -73,6 +94,10 @@ impl AuthTokens {
     /// Check whether the access token is expired (or will expire within
     /// `REFRESH_MARGIN_SECS`).
     pub fn is_expired(&self) -> bool {
+        if let Some(exp) = token_expiration(&self.access_token) {
+            return Utc::now() + TimeDelta::seconds(REFRESH_MARGIN_SECS) >= exp;
+        }
+
         let obtained = self
             .obtained_at
             .as_ref()
@@ -116,6 +141,58 @@ pub fn extract_account_id(token: &str) -> Option<String> {
         .get("sub")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn token_expiration(token: &str) -> Option<chrono::DateTime<Utc>> {
+    let claims = decode_jwt_payload(token)?;
+    let exp = claims.get("exp")?.as_i64()?;
+    chrono::DateTime::from_timestamp(exp, 0)
+}
+
+fn parse_auth_tokens(data: &str) -> anyhow::Result<AuthTokens> {
+    if let Ok(tokens) = serde_json::from_str::<AuthTokens>(data) {
+        return Ok(tokens);
+    }
+
+    let value: serde_json::Value = serde_json::from_str(data)?;
+    let tokens = value
+        .get("tokens")
+        .ok_or_else(|| anyhow::anyhow!("Missing tokens in auth file"))?;
+
+    let access_token = tokens
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing access_token in auth file"))?
+        .to_string();
+    let refresh_token = tokens
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let id_token = tokens
+        .get("id_token")
+        .and_then(|v| {
+            v.as_str()
+                .or_else(|| v.get("raw_jwt").and_then(|raw| raw.as_str()))
+        })
+        .map(ToString::to_string);
+    let account_id = tokens
+        .get("account_id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .or_else(|| extract_account_id(&access_token));
+
+    Ok(AuthTokens {
+        access_token,
+        refresh_token,
+        id_token,
+        token_type: Some("Bearer".to_string()),
+        expires_in: None,
+        obtained_at: value
+            .get("last_refresh")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        account_id,
+    })
 }
 
 // ── PKCE ──────────────────────────────────────────────────────────────────
@@ -451,11 +528,4 @@ fn random_state() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn dirs_home() -> PathBuf {
-    // Respect $HOME on Unix; fall back to `~`.
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("~"))
 }

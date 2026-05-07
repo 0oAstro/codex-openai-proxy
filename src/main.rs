@@ -8,6 +8,7 @@ mod config;
 mod images;
 mod models;
 mod proxy;
+mod usage;
 
 #[derive(Parser)]
 #[command(
@@ -139,6 +140,7 @@ async fn run_server(port: u16, host: &str, codex_version: Option<String>) -> any
 
     let app = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
+        .route("/usage", axum::routing::get(usage::handle_usage))
         .route("/v1/models", axum::routing::get(models::handle_models))
         .route(
             "/v1/responses",

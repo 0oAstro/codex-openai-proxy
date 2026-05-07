@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ pub const UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/codex";
 pub const SCOPES: &str = "openid profile email offline_access";
 /// Auth file lives directly at `~/auth.json`.
 pub const AUTH_FILE: &str = "auth.json";
+pub const AUTH_FILE_ENV: &str = "CODEX_AUTH_FILE";
 
 /// Fallback version if dynamic fetch fails.
 pub const FALLBACK_CLIENT_VERSION: &str = "0.125.0";
@@ -37,6 +39,28 @@ pub const BUILTIN_MODELS: &[&str] = &["gpt-image-2"];
 /// If set, all requests (except /health) require `Authorization: Bearer <key>`.
 pub fn proxy_api_key() -> Option<String> {
     std::env::var("PROXY_API_KEY").ok()
+}
+
+/// Resolve the ChatGPT OAuth token file.
+///
+/// `CODEX_AUTH_FILE` is useful in containers where credentials should live in
+/// a mounted application directory instead of whatever `$HOME` happens to be.
+pub fn auth_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var(AUTH_FILE_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            return path;
+        }
+        return dirs_home().join(path);
+    }
+
+    dirs_home().join(AUTH_FILE)
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("~"))
 }
 
 // ── Shared application state ──────────────────────────────────────────────
