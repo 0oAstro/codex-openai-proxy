@@ -392,13 +392,8 @@ fn build_responses_body(req: &ChatRequest) -> Value {
         body["top_p"] = serde_json::json!(p);
     }
 
-    // Max output tokens: max_completion_tokens takes priority over max_tokens.
-    let max_out = req
-        .max_completion_tokens
-        .or(req.max_tokens);
-    if let Some(m) = max_out {
-        body["max_output_tokens"] = serde_json::json!(m);
-    }
+    // Codex rejects the Responses API token cap, so chat token limits are
+    // intentionally accepted for OpenAI compatibility but not forwarded.
 
     // Stop sequences
     if let Some(ref stop) = req.stop {
@@ -1281,6 +1276,17 @@ mod tests {
         assert_eq!(body["instructions"], "follow the repo instructions");
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn chat_translation_omits_unsupported_token_caps() {
+        let mut req = request(vec![message("user", "title this")]);
+        req.max_tokens = Some(12);
+        req.max_completion_tokens = Some(8);
+
+        let body = build_responses_body(&req);
+
+        assert!(body.get("max_output_tokens").is_none());
     }
 
     #[test]
