@@ -18,6 +18,10 @@ pub struct OpenAIModel {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +37,10 @@ struct UpstreamModel {
     slug: String,
     #[allow(dead_code)]
     display_name: Option<String>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +118,8 @@ impl ModelsCache {
                 object: "model",
                 created: 1_700_000_000,
                 owned_by: "openai",
+                context_window: m.context_window,
+                max_output_tokens: m.max_output_tokens,
             })
             .collect();
 
@@ -123,6 +133,8 @@ impl ModelsCache {
                     object: "model",
                     created: 1_700_000_000,
                     owned_by: "openai",
+                    context_window: None,
+                    max_output_tokens: None,
                 });
             }
         }

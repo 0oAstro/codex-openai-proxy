@@ -382,15 +382,11 @@ fn build_responses_body(req: &ChatRequest) -> Value {
         body["reasoning"] = serde_json::json!({"effort": effort});
     }
 
-    // Temperature
-    if let Some(t) = req.temperature {
-        body["temperature"] = serde_json::json!(t);
-    }
-
-    // Top P
-    if let Some(p) = req.top_p {
-        body["top_p"] = serde_json::json!(p);
-    }
+    // Sampling controls are intentionally accepted for OpenAI compatibility
+    // but not forwarded. Codex Responses rejects these fields for GPT-5/Codex
+    // models, and callers frequently send low-temperature chat-completion
+    // defaults that would otherwise turn into 400s before Bifrost can fall
+    // back or retry cleanly.
 
     // Codex rejects the Responses API token cap, so chat token limits are
     // intentionally accepted for OpenAI compatibility but not forwarded.
@@ -1287,6 +1283,18 @@ mod tests {
         let body = build_responses_body(&req);
 
         assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn chat_translation_omits_unsupported_sampling_params() {
+        let mut req = request(vec![message("user", "title this")]);
+        req.temperature = Some(0.1);
+        req.top_p = Some(0.2);
+
+        let body = build_responses_body(&req);
+
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
     }
 
     #[test]
