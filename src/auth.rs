@@ -458,9 +458,10 @@ pub async fn device_login_flow() -> anyhow::Result<AuthTokens> {
 
     info!("Device code authorized, exchanging for tokens…");
 
-    // Step 3: Exchange authorization_code via standard PKCE token exchange
-    // The device auth flow returns authorization_code + PKCE codes server-side
-    let redirect_uri = format!("{DEVICE_AUTH_BASE}/deviceauth/callback");
+    // Step 3: Exchange authorization_code via standard PKCE token exchange.
+    // The device auth API endpoints live under /api/accounts, but the OAuth
+    // redirect URI is rooted at the auth issuer. This matches openai/codex.
+    let redirect_uri = "https://auth.openai.com/deviceauth/callback";
     let token_resp = client
         .post(TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -489,6 +490,7 @@ pub async fn device_login_flow() -> anyhow::Result<AuthTokens> {
 
 #[derive(Deserialize)]
 struct DeviceCodeResp {
+    #[serde(alias = "usercode")]
     user_code: String,
     device_auth_id: String,
     #[serde(
