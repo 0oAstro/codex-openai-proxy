@@ -491,12 +491,52 @@ pub async fn device_login_flow() -> anyhow::Result<AuthTokens> {
 struct DeviceCodeResp {
     user_code: String,
     device_auth_id: String,
-    #[serde(default = "default_interval")]
+    #[serde(
+        default = "default_interval",
+        deserialize_with = "deserialize_interval"
+    )]
     interval: u64,
 }
 
 fn default_interval() -> u64 {
     5
+}
+
+fn deserialize_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct IntervalVisitor;
+
+    impl serde::de::Visitor<'_> for IntervalVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a u64 or a string containing a u64")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            u64::try_from(value).map_err(|_| E::custom("interval cannot be negative"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            value
+                .parse::<u64>()
+                .map_err(|_| E::custom("interval string must contain a u64"))
+        }
+    }
+
+    deserializer.deserialize_any(IntervalVisitor)
 }
 
 #[derive(Deserialize)]
