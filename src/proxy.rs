@@ -181,6 +181,7 @@ async fn collect_sse_to_json(upstream: reqwest::Response, status: StatusCode) ->
 
     let text = String::from_utf8_lossy(&raw);
     let mut last_response: Option<Value> = None;
+    let mut output_items: Vec<Value> = Vec::new();
 
     for line in text.lines() {
         let line = line.trim();
@@ -200,6 +201,17 @@ async fn collect_sse_to_json(upstream: reqwest::Response, status: StatusCode) ->
             Err(_) => continue,
         };
 
+        // ChatGPT Codex streaming responses no longer include the accumulated
+        // `output` array on the final `response.completed.response` object.
+        // OpenAI-compatible non-streaming Responses clients still expect it,
+        // so reconstruct it from completed output-item events while collecting
+        // the stream.
+        if event.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
+            if let Some(item) = event.get("item").cloned() {
+                output_items.push(item);
+            }
+        }
+
         // Track the latest `response` object from any event that carries it.
         if let Some(resp) = event.get("response").cloned() {
             last_response = Some(resp);
@@ -207,7 +219,17 @@ async fn collect_sse_to_json(upstream: reqwest::Response, status: StatusCode) ->
     }
 
     match last_response {
-        Some(resp) => {
+        Some(mut resp) => {
+            let needs_output = resp
+                .get("output")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty);
+            if needs_output && !output_items.is_empty() {
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert("output".to_string(), Value::Array(output_items));
+                }
+            }
+
             let mut builder = Response::builder().status(status);
             builder = builder.header(reqwest::header::CONTENT_TYPE, "application/json");
             match builder.body(axum::body::Body::from(
@@ -276,6 +298,43 @@ async fn load_and_refresh_auth() -> Result<crate::auth::AuthTokens, String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn collect_sse_to_json_reconstructs_missing_completed_output() {
+        let app = axum::Router::new().route(
+            "/sse",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "event: response.output_item.done\n",
+                        r#"data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+                        "\n\n",
+                        "event: response.completed\n",
+                        r#"data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[]}}"#,
+                        "\n\n",
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let upstream = reqwest::get(format!("http://{addr}/sse")).await.unwrap();
+        let response = collect_sse_to_json(upstream, StatusCode::OK).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["id"], "resp_1");
+        assert_eq!(parsed["output"][0]["id"], "msg_1");
+        assert_eq!(parsed["output"][0]["content"][0]["text"], "ok");
+    }
+
     #[test]
     fn sanitize_responses_body_adds_required_instructions_and_store() {
         let (body, stream_requested) = sanitize_responses_body(
@@ -300,8 +359,7 @@ mod tests {
 
     #[test]
     fn sanitize_responses_body_preserves_existing_store() {
-        let (body, _) =
-            sanitize_responses_body(br#"{"model":"gpt-5.5","store":true}"#);
+        let (body, _) = sanitize_responses_body(br#"{"model":"gpt-5.5","store":true}"#);
         let parsed: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(parsed["store"], true);
