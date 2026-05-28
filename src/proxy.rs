@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -5,7 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::stream::StreamExt;
+use futures::stream::{self, Stream, StreamExt};
 use serde_json::Value;
 use tracing::{debug, error, info};
 
@@ -142,9 +144,7 @@ async fn stream_response(upstream: reqwest::Response, stream_requested: bool) ->
         .get(reqwest::header::CONTENT_TYPE)
         .cloned();
 
-    let stream = upstream
-        .bytes_stream()
-        .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let stream = transform_response_sse_stream(upstream.bytes_stream());
     let body = Body::from_stream(stream);
 
     let mut builder = Response::builder().status(status);
@@ -161,6 +161,135 @@ async fn stream_response(upstream: reqwest::Response, stream_requested: bool) ->
         )
             .into_response(),
     }
+}
+
+struct ResponseSseTransformState {
+    upstream: Pin<Box<dyn Stream<Item = reqwest::Result<axum::body::Bytes>> + Send>>,
+    buffer: String,
+    output_items: Vec<Value>,
+    pending: VecDeque<Result<axum::body::Bytes, std::io::Error>>,
+    upstream_done: bool,
+}
+
+fn transform_response_sse_stream<S>(
+    upstream: S,
+) -> impl Stream<Item = Result<axum::body::Bytes, std::io::Error>>
+where
+    S: Stream<Item = reqwest::Result<axum::body::Bytes>> + Send + 'static,
+{
+    let state = ResponseSseTransformState {
+        upstream: Box::pin(upstream),
+        buffer: String::new(),
+        output_items: Vec::new(),
+        pending: VecDeque::new(),
+        upstream_done: false,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(item) = state.pending.pop_front() {
+                return Some((item, state));
+            }
+
+            if state.upstream_done {
+                if !state.buffer.is_empty() {
+                    let frame = std::mem::take(&mut state.buffer);
+                    let transformed = transform_response_sse_frame(&frame, &mut state.output_items);
+                    return Some((Ok(axum::body::Bytes::from(transformed)), state));
+                }
+                return None;
+            }
+
+            match state.upstream.next().await {
+                Some(Ok(bytes)) => {
+                    state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    drain_complete_sse_frames(&mut state);
+                }
+                Some(Err(e)) => {
+                    return Some((
+                        Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                        state,
+                    ));
+                }
+                None => {
+                    state.upstream_done = true;
+                }
+            }
+        }
+    })
+}
+
+fn drain_complete_sse_frames(state: &mut ResponseSseTransformState) {
+    while let Some((frame_len, sep_len)) = next_sse_frame(&state.buffer) {
+        let rest = state.buffer.split_off(frame_len + sep_len);
+        state.buffer.truncate(frame_len);
+        let frame = std::mem::replace(&mut state.buffer, rest);
+        let transformed = transform_response_sse_frame(&frame, &mut state.output_items);
+        state
+            .pending
+            .push_back(Ok(axum::body::Bytes::from(transformed)));
+    }
+}
+
+fn next_sse_frame(buffer: &str) -> Option<(usize, usize)> {
+    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
+        (Some(lf), Some(crlf)) if crlf < lf => Some((crlf, 4)),
+        (Some(lf), _) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
+}
+
+fn transform_response_sse_frame(frame: &str, output_items: &mut Vec<Value>) -> String {
+    let mut transformed_lines = Vec::new();
+
+    for raw_line in frame.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data: ") else {
+            transformed_lines.push(line.to_string());
+            continue;
+        };
+
+        if data.trim() == "[DONE]" {
+            transformed_lines.push(line.to_string());
+            continue;
+        }
+
+        let mut event: Value = match serde_json::from_str(data.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                transformed_lines.push(line.to_string());
+                continue;
+            }
+        };
+
+        if event.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
+            if let Some(item) = event.get("item").cloned() {
+                output_items.push(item);
+            }
+        }
+
+        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+            if let Some(resp) = event.get_mut("response") {
+                let needs_output = resp
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty);
+                if needs_output && !output_items.is_empty() {
+                    if let Some(obj) = resp.as_object_mut() {
+                        obj.insert("output".to_string(), Value::Array(output_items.clone()));
+                    }
+                }
+            }
+        }
+
+        transformed_lines.push(format!(
+            "data: {}",
+            serde_json::to_string(&event).unwrap_or_else(|_| data.to_string())
+        ));
+    }
+
+    transformed_lines.join("\n") + "\n\n"
 }
 
 /// Collect an SSE stream from upstream into a single JSON response.
@@ -333,6 +462,36 @@ mod tests {
         assert_eq!(parsed["id"], "resp_1");
         assert_eq!(parsed["output"][0]["id"], "msg_1");
         assert_eq!(parsed["output"][0]["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn streaming_transform_injects_output_into_completed_event() {
+        let mut output_items = Vec::new();
+
+        let item_frame = concat!(
+            "event: response.output_item.done\n",
+            r#"data: {"type":"response.output_item.done","item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+        );
+        let completed_frame = concat!(
+            "event: response.completed\n",
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed"}}"#,
+        );
+
+        let item_out = transform_response_sse_frame(item_frame, &mut output_items);
+        let completed_out = transform_response_sse_frame(completed_frame, &mut output_items);
+
+        let completed_data = completed_out
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("completed data line");
+        let completed: Value = serde_json::from_str(completed_data).unwrap();
+
+        assert!(item_out.contains("response.output_item.done"));
+        assert_eq!(completed["response"]["output"][0]["id"], "msg_1");
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0]["text"],
+            "ok"
+        );
     }
 
     #[test]
