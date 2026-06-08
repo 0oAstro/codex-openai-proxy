@@ -25,7 +25,8 @@ CLI output, HTTP responses, debug logs, tests, fixtures, or documentation.
   credentials. Do not mix the two auth domains.
 - Token refresh must use the stored refresh token only for upstream
   authentication recovery, using the Codex-compatible JSON refresh-token
-  request shape against `https://auth.openai.com/oauth/token`.
+  request shape against `https://auth.openai.com/oauth/token`. Container deployments
+  must mount the auth file read-write so refreshed tokens can be persisted.
 
 ## Upstream Identity Headers
 

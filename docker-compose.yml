@@ -10,7 +10,7 @@ services:
       PROXY_API_KEY: ${PROXY_API_KEY:-}
       CODEX_AUTH_FILE: /opt/codex-openai-proxy/auth.json
     volumes:
-      - /opt/codex-openai-proxy/auth.json:/opt/codex-openai-proxy/auth.json:ro
+      - /opt/codex-openai-proxy/auth.json:/opt/codex-openai-proxy/auth.json
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/health"]
       interval: 30s

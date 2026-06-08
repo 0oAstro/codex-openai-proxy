@@ -108,7 +108,7 @@ docker network create main-network
 docker compose up -d
 ```
 
-The container mounts `/opt/codex-openai-proxy/auth.json` from the host and sets `CODEX_AUTH_FILE=/opt/codex-openai-proxy/auth.json`. Run `codex-openai-proxy login-device` on the host or copy an existing Codex-compatible `auth.json` there before starting the service.
+The container mounts `/opt/codex-openai-proxy/auth.json` read-write and sets `CODEX_AUTH_FILE=/opt/codex-openai-proxy/auth.json` so automatic token refresh can persist refreshed tokens. Run `codex-openai-proxy login-device` on the host or copy an existing Codex-compatible `auth.json` there before starting the service.
 
 ## Example: Using with OpenAI SDK
 
