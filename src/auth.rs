@@ -27,6 +27,9 @@ pub struct AuthTokens {
     pub obtained_at: Option<String>,
     /// Account id extracted from the JWT (sub claim).
     pub account_id: Option<String>,
+    /// Whether the selected ChatGPT account requires the FedRAMP routing header.
+    #[serde(default)]
+    pub chatgpt_account_is_fedramp: bool,
 }
 
 impl AuthTokens {
@@ -70,6 +73,10 @@ impl AuthTokens {
                     if let Some(account_id) = self.account_id.as_ref() {
                         value["tokens"]["account_id"] =
                             serde_json::Value::String(account_id.clone());
+                    }
+                    if self.chatgpt_account_is_fedramp {
+                        value["tokens"]["chatgpt_account_is_fedramp"] =
+                            serde_json::Value::Bool(true);
                     }
                     value["last_refresh"] = serde_json::Value::String(Utc::now().to_rfc3339());
                     fs::write(&p, serde_json::to_string_pretty(&value)?)?;
@@ -158,6 +165,22 @@ fn extract_chatgpt_account_id(token: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn extract_chatgpt_account_is_fedramp(token: &str) -> bool {
+    let Some(claims) = decode_jwt_payload(token) else {
+        return false;
+    };
+    claims
+        .get("chatgpt_account_is_fedramp")
+        .or_else(|| claims.get("https://api.openai.com/auth"))
+        .and_then(|v| {
+            v.as_bool().or_else(|| {
+                v.get("chatgpt_account_is_fedramp")
+                    .and_then(|nested| nested.as_bool())
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn token_expiration(token: &str) -> Option<chrono::DateTime<Utc>> {
     let claims = decode_jwt_payload(token)?;
     let exp = claims.get("exp")?.as_i64()?;
@@ -196,6 +219,15 @@ pub(crate) fn parse_auth_tokens(data: &str) -> anyhow::Result<AuthTokens> {
         .map(ToString::to_string)
         .or_else(|| id_token.as_deref().and_then(extract_chatgpt_account_id))
         .or_else(|| extract_account_id(&access_token));
+    let chatgpt_account_is_fedramp = tokens
+        .get("chatgpt_account_is_fedramp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| {
+            id_token
+                .as_deref()
+                .map(extract_chatgpt_account_is_fedramp)
+                .unwrap_or(false)
+        });
 
     Ok(AuthTokens {
         access_token,
@@ -208,6 +240,7 @@ pub(crate) fn parse_auth_tokens(data: &str) -> anyhow::Result<AuthTokens> {
             .and_then(|v| v.as_str())
             .map(ToString::to_string),
         account_id,
+        chatgpt_account_is_fedramp,
     })
 }
 
@@ -586,6 +619,10 @@ fn parse_token_response(raw: serde_json::Value) -> anyhow::Result<AuthTokens> {
         .as_deref()
         .and_then(extract_chatgpt_account_id)
         .or_else(|| extract_account_id(&access_token));
+    let chatgpt_account_is_fedramp = id_token
+        .as_deref()
+        .map(extract_chatgpt_account_is_fedramp)
+        .unwrap_or(false);
 
     Ok(AuthTokens {
         access_token,
@@ -595,6 +632,7 @@ fn parse_token_response(raw: serde_json::Value) -> anyhow::Result<AuthTokens> {
         expires_in: raw["expires_in"].as_i64(),
         obtained_at: Some(Utc::now().to_rfc3339()),
         account_id,
+        chatgpt_account_is_fedramp,
     })
 }
 
@@ -630,6 +668,29 @@ mod tests {
 
         assert_eq!(parsed.account_id.as_deref(), Some("acct_123"));
         assert_eq!(parsed.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    #[test]
+    fn parse_codex_auth_json_reads_fedramp_flag_from_id_token() {
+        let access_token = jwt_with_claims(serde_json::json!({"sub":"access-sub"}));
+        let id_token = jwt_with_claims(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id":"acct_123",
+                "chatgpt_account_is_fedramp": true
+            }
+        }));
+        let raw = serde_json::json!({
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "refresh",
+                "id_token": {"raw_jwt": id_token}
+            },
+            "last_refresh": "2026-01-01T00:00:00Z"
+        });
+
+        let parsed = parse_auth_tokens(&raw.to_string()).unwrap();
+
+        assert!(parsed.chatgpt_account_is_fedramp);
     }
 
     #[test]

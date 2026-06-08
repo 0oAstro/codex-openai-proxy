@@ -12,7 +12,7 @@ use serde_json::Value;
 use tracing::{debug, error, info};
 
 use crate::config::AppState;
-use crate::models::build_auth_headers;
+use crate::models::{build_auth_headers, copy_codex_passthrough_headers};
 
 /// Passthrough handler for `/v1/responses`.
 ///
@@ -44,12 +44,7 @@ pub async fn handle_responses(
             .parse()
             .expect("valid header value"),
     );
-    // Copy selected headers from the incoming request (e.g. OpenAI-Beta, OpenAI-Organization).
-    for key in &["openai-beta", "openai-organization", "openai-project"] {
-        if let Some(val) = headers.get(*key) {
-            auth_headers.insert(*key, val.clone());
-        }
-    }
+    copy_codex_passthrough_headers(&headers, &mut auth_headers);
 
     let url = format!("{}/responses", crate::config::UPSTREAM_BASE);
     debug!("Proxying to upstream: {url}");
@@ -91,11 +86,7 @@ pub async fn handle_responses(
                                 .parse()
                                 .expect("valid header value"),
                         );
-                        for key in &["openai-beta", "openai-organization", "openai-project"] {
-                            if let Some(val) = headers.get(*key) {
-                                retry_headers.insert(*key, val.clone());
-                            }
-                        }
+                        copy_codex_passthrough_headers(&headers, &mut retry_headers);
 
                         let retry_resp = match state
                             .http

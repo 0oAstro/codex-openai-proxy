@@ -194,8 +194,14 @@ pub fn build_auth_headers(tokens: &crate::auth::AuthTokens, user_agent: &str) ->
     );
     if let Some(ref aid) = tokens.account_id {
         headers.insert(
-            "chatgpt-account-id",
+            "ChatGPT-Account-ID",
             aid.parse().expect("valid header value"),
+        );
+    }
+    if tokens.chatgpt_account_is_fedramp {
+        headers.insert(
+            "X-OpenAI-Fedramp",
+            "true".parse().expect("valid header value"),
         );
     }
     headers.insert(
@@ -217,4 +223,20 @@ pub fn build_auth_headers(tokens: &crate::auth::AuthTokens, user_agent: &str) ->
         ORIGINATOR.parse().expect("valid header value"),
     );
     headers
+}
+
+pub fn copy_codex_passthrough_headers(src: &HeaderMap, dst: &mut HeaderMap) {
+    for key in &[
+        "openai-beta",
+        "openai-organization",
+        "openai-project",
+        "x-client-request-id",
+        "session_id",
+        "thread_id",
+        "x-openai-subagent",
+    ] {
+        if let Some(val) = src.get(*key) {
+            dst.insert(*key, val.clone());
+        }
+    }
 }

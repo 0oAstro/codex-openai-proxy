@@ -12,7 +12,7 @@ use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AppState, REASONING_EFFORTS, UPSTREAM_BASE};
-use crate::models::build_auth_headers;
+use crate::models::{build_auth_headers, copy_codex_passthrough_headers};
 
 // ── Request types ─────────────────────────────────────────────────────────
 
@@ -502,11 +502,7 @@ pub async fn handle_chat_completions(
             .parse()
             .expect("valid header value"),
     );
-    for key in &["openai-beta", "openai-organization", "openai-project"] {
-        if let Some(val) = headers.get(*key) {
-            auth_headers.insert(*key, val.clone());
-        }
-    }
+    copy_codex_passthrough_headers(&headers, &mut auth_headers);
 
     let url = format!("{}/responses", UPSTREAM_BASE);
     let upstream_resp = match state
@@ -543,11 +539,7 @@ pub async fn handle_chat_completions(
                                 .parse()
                                 .expect("valid header value"),
                         );
-                        for key in &["openai-beta", "openai-organization", "openai-project"] {
-                            if let Some(val) = headers.get(*key) {
-                                retry_headers.insert(*key, val.clone());
-                            }
-                        }
+                        copy_codex_passthrough_headers(&headers, &mut retry_headers);
                         let retry_resp = state
                             .http
                             .post(&url)

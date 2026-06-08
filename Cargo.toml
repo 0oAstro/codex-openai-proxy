@@ -26,3 +26,4 @@ open = "5"
 axum-extra = { version = "0.9", features = ["typed-header"] }
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
+os_info = "3"

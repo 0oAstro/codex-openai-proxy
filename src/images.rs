@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing::{debug, error, info};
 
 use crate::config::AppState;
-use crate::models::build_auth_headers;
+use crate::models::{build_auth_headers, copy_codex_passthrough_headers};
 
 const DEFAULT_IMAGES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_IMAGES_TOOL_MODEL: &str = "gpt-image-2";
@@ -165,11 +165,10 @@ fn resolve_response_format(fmt: Option<&str>) -> String {
     }
 }
 
-fn build_tool_json(action: &str, image_model: &str, params: &ImageToolParams) -> Value {
+fn build_tool_json(params: &ImageToolParams) -> Value {
     let mut tool = serde_json::json!({
         "type": "image_generation",
-        "action": action,
-        "model": image_model,
+        "output_format": params.output_format.as_deref().unwrap_or("png"),
     });
 
     if let Some(ref v) = params.size {
@@ -180,9 +179,6 @@ fn build_tool_json(action: &str, image_model: &str, params: &ImageToolParams) ->
     }
     if let Some(ref v) = params.background {
         tool["background"] = Value::String(v.clone());
-    }
-    if let Some(ref v) = params.output_format {
-        tool["output_format"] = Value::String(v.clone());
     }
     if let Some(v) = params.output_compression {
         tool["output_compression"] = Value::Number(v.into());
@@ -413,11 +409,11 @@ async fn send_responses_request(
     };
 
     let mut auth_headers = build_auth_headers(&auth, &state.codex_user_agent().await);
-    for key in &["openai-beta", "openai-organization", "openai-project"] {
-        if let Some(val) = headers.get(*key) {
-            auth_headers.insert(*key, val.clone());
-        }
-    }
+    copy_codex_passthrough_headers(headers, &mut auth_headers);
+    auth_headers.insert(
+        axum::http::header::ACCEPT,
+        "text/event-stream".parse().expect("valid header value"),
+    );
 
     let url = format!("{}/responses", crate::config::UPSTREAM_BASE);
     debug!("Sending images request to upstream: {url}");
@@ -459,11 +455,11 @@ async fn retry_on_401(
                 Ok(refreshed) => {
                     let mut auth_headers =
                         build_auth_headers(&refreshed, &state.codex_user_agent().await);
-                    for key in &["openai-beta", "openai-organization", "openai-project"] {
-                        if let Some(val) = headers.get(*key) {
-                            auth_headers.insert(*key, val.clone());
-                        }
-                    }
+                    copy_codex_passthrough_headers(headers, &mut auth_headers);
+                    auth_headers.insert(
+                        axum::http::header::ACCEPT,
+                        "text/event-stream".parse().expect("valid header value"),
+                    );
                     let url = format!("{}/responses", crate::config::UPSTREAM_BASE);
                     match state
                         .http
@@ -752,7 +748,7 @@ pub async fn handle_images_generations(
         mask_image_url: None,
     };
 
-    let tool_json = build_tool_json("generate", &image_model, &tool_params);
+    let tool_json = build_tool_json(&tool_params);
     let responses_req = build_responses_request(&prompt, &[], &tool_json, &main_model);
 
     let upstream = match send_responses_request(&state, &headers, &responses_req).await {
@@ -850,7 +846,7 @@ async fn handle_images_edits_json_inner(
         mask_image_url: mask_url,
     };
 
-    let tool_json = build_tool_json("edit", &image_model, &tool_params);
+    let tool_json = build_tool_json(&tool_params);
     let responses_req = build_responses_request(&prompt, &images, &tool_json, &main_model);
 
     let upstream = match send_responses_request(&state, &headers, &responses_req).await {
@@ -948,7 +944,7 @@ async fn handle_images_edits_multipart_inner(
         mask_image_url: mask_data_url,
     };
 
-    let tool_json = build_tool_json("edit", &image_model, &tool_params);
+    let tool_json = build_tool_json(&tool_params);
     let responses_req = build_responses_request(&prompt, &images, &tool_json, &main_model);
 
     let upstream = match send_responses_request(&state, &headers, &responses_req).await {

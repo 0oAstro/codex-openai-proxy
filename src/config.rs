@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::HeaderValue;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -70,9 +71,60 @@ pub const ORIGINATOR: &str = "codex_cli_rs";
 /// shape closely enough for ChatGPT backend feature gates while remaining
 /// deterministic in containers.
 pub fn codex_user_agent_for_version(version: &str) -> String {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    format!("{ORIGINATOR}/{version} ({os}; {arch})")
+    let os = os_info::get();
+    let os_type = os.os_type().to_string();
+    let os_version = os.version().to_string();
+    let arch = os.architecture().unwrap_or("unknown");
+    let terminal = terminal_user_agent_token();
+    sanitize_user_agent(format!(
+        "{ORIGINATOR}/{version} ({os_type} {os_version}; {arch}) {terminal}"
+    ))
+}
+
+fn terminal_user_agent_token() -> String {
+    if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
+        if !term_program.trim().is_empty() {
+            if let Ok(version) = std::env::var("TERM_PROGRAM_VERSION") {
+                if !version.trim().is_empty() {
+                    return sanitize_header_token(format!("{term_program}/{version}"));
+                }
+            }
+            return sanitize_header_token(term_program);
+        }
+    }
+
+    if let Ok(version) = std::env::var("WEZTERM_VERSION") {
+        if !version.trim().is_empty() {
+            return sanitize_header_token(format!("WezTerm/{version}"));
+        }
+    }
+
+    if let Ok(term) = std::env::var("TERM") {
+        if !term.trim().is_empty() {
+            return sanitize_header_token(term);
+        }
+    }
+
+    "unknown".to_string()
+}
+
+fn sanitize_header_token(value: String) -> String {
+    value
+        .chars()
+        .map(|ch| if matches!(ch, ' '..='~') { ch } else { '_' })
+        .collect()
+}
+
+fn sanitize_user_agent(candidate: String) -> String {
+    if HeaderValue::from_str(&candidate).is_ok() {
+        return candidate;
+    }
+    let sanitized = sanitize_header_token(candidate);
+    if HeaderValue::from_str(&sanitized).is_ok() {
+        sanitized
+    } else {
+        ORIGINATOR.to_string()
+    }
 }
 
 fn dirs_home() -> PathBuf {
