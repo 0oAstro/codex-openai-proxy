@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
 use crate::config::{
-    auth_file_path, AUTH_URL, CLIENT_ID, REDIRECT_URI, REFRESH_MARGIN_SECS, REVOKE_URL, SCOPES,
-    TOKEN_URL,
+    auth_file_path, AUTH_URL, CLIENT_ID, ORIGINATOR, REDIRECT_URI, REFRESH_MARGIN_SECS, REVOKE_URL,
+    SCOPES, TOKEN_URL,
 };
 
 // ── Stored token data ─────────────────────────────────────────────────────
@@ -143,13 +143,28 @@ pub fn extract_account_id(token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn extract_chatgpt_account_id(token: &str) -> Option<String> {
+    let claims = decode_jwt_payload(token)?;
+    claims
+        .get("chatgpt_account_id")
+        .or_else(|| claims.get("https://api.openai.com/auth"))
+        .and_then(|v| {
+            v.as_str().or_else(|| {
+                v.get("chatgpt_account_id")
+                    .and_then(|nested| nested.as_str())
+            })
+        })
+        .or_else(|| claims.get("sub").and_then(|v| v.as_str()))
+        .map(ToString::to_string)
+}
+
 fn token_expiration(token: &str) -> Option<chrono::DateTime<Utc>> {
     let claims = decode_jwt_payload(token)?;
     let exp = claims.get("exp")?.as_i64()?;
     chrono::DateTime::from_timestamp(exp, 0)
 }
 
-fn parse_auth_tokens(data: &str) -> anyhow::Result<AuthTokens> {
+pub(crate) fn parse_auth_tokens(data: &str) -> anyhow::Result<AuthTokens> {
     if let Ok(tokens) = serde_json::from_str::<AuthTokens>(data) {
         return Ok(tokens);
     }
@@ -179,6 +194,7 @@ fn parse_auth_tokens(data: &str) -> anyhow::Result<AuthTokens> {
         .get("account_id")
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
+        .or_else(|| id_token.as_deref().and_then(extract_chatgpt_account_id))
         .or_else(|| extract_account_id(&access_token));
 
     Ok(AuthTokens {
@@ -233,8 +249,14 @@ pub async fn login_flow() -> anyhow::Result<AuthTokens> {
     let state = random_state();
 
     let auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&codex_cli_simplified_flow=true",
-        AUTH_URL, CLIENT_ID, urlencoding::encode(REDIRECT_URI), urlencoding::encode(SCOPES), pkce.challenge, state,
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator={}",
+        AUTH_URL,
+        CLIENT_ID,
+        urlencoding::encode(REDIRECT_URI),
+        urlencoding::encode(SCOPES),
+        pkce.challenge,
+        state,
+        urlencoding::encode(ORIGINATOR),
     );
 
     println!("Opening browser for login…");
@@ -331,12 +353,12 @@ pub async fn refresh_token(refresh: &str) -> anyhow::Result<AuthTokens> {
     let client = reqwest::Client::new();
     let resp = client
         .post(TOKEN_URL)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "grant_type=refresh_token&client_id={}&refresh_token={}",
-            CLIENT_ID,
-            urlencoding::encode(refresh),
-        ))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": CLIENT_ID,
+            "refresh_token": refresh,
+        }))
         .send()
         .await?;
 
@@ -419,12 +441,12 @@ pub async fn device_login_flow() -> anyhow::Result<AuthTokens> {
 
     let dc: DeviceCodeResp = resp.json().await?;
     println!(
-        "\nOpen this URL in any browser:\n  https://auth.openai.com/codex/device\n\nEnter this code:\n  {}\n\n(expires in 15 minutes)",
+        "\nOpen this URL in any browser:\n  {DEVICE_VERIFY_URL}\n\nEnter this code:\n  {}\n\n(expires in 15 minutes)",
         dc.user_code
     );
 
     // Step 2: Poll for authorization
-    let poll_interval = std::time::Duration::from_secs(dc.interval.max(5));
+    let poll_interval = std::time::Duration::from_secs(dc.interval.max(1));
     let max_wait = std::time::Duration::from_secs(15 * 60);
     let start = std::time::Instant::now();
 
@@ -432,8 +454,6 @@ pub async fn device_login_flow() -> anyhow::Result<AuthTokens> {
         if start.elapsed() >= max_wait {
             anyhow::bail!("Device code timed out after 15 minutes");
         }
-
-        tokio::time::sleep(poll_interval).await;
 
         let poll_resp = client
             .post(format!("{DEVICE_AUTH_BASE}/deviceauth/token"))
@@ -448,12 +468,19 @@ pub async fn device_login_flow() -> anyhow::Result<AuthTokens> {
             break poll_resp.json::<DeviceCodeSuccessResp>().await?;
         }
 
-        // 403/404 = still pending, keep polling
+        // 403/404 = still pending, keep polling.
         let status = poll_resp.status();
-        if status != reqwest::StatusCode::FORBIDDEN && status != reqwest::StatusCode::NOT_FOUND {
-            let body = poll_resp.text().await.unwrap_or_default();
-            anyhow::bail!("Device auth failed ({status}): {body}");
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+            if start.elapsed() >= max_wait {
+                anyhow::bail!("Device code timed out after 15 minutes");
+            }
+            let sleep_for = poll_interval.min(max_wait - start.elapsed());
+            tokio::time::sleep(sleep_for).await;
+            continue;
         }
+
+        let body = poll_resp.text().await.unwrap_or_default();
+        anyhow::bail!("Device auth failed ({status}): {body}");
     };
 
     info!("Device code authorized, exchanging for tokens…");
@@ -544,6 +571,7 @@ where
 #[derive(Deserialize)]
 struct DeviceCodeSuccessResp {
     authorization_code: String,
+    #[allow(dead_code)]
     code_challenge: String,
     code_verifier: String,
 }
@@ -553,17 +581,75 @@ fn parse_token_response(raw: serde_json::Value) -> anyhow::Result<AuthTokens> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing access_token in token response"))?
         .to_string();
-    let account_id = extract_account_id(&access_token);
+    let id_token = raw["id_token"].as_str().map(|s| s.to_string());
+    let account_id = id_token
+        .as_deref()
+        .and_then(extract_chatgpt_account_id)
+        .or_else(|| extract_account_id(&access_token));
 
     Ok(AuthTokens {
         access_token,
         refresh_token: raw["refresh_token"].as_str().map(|s| s.to_string()),
-        id_token: raw["id_token"].as_str().map(|s| s.to_string()),
+        id_token,
         token_type: raw["token_type"].as_str().map(|s| s.to_string()),
         expires_in: raw["expires_in"].as_i64(),
         obtained_at: Some(Utc::now().to_rfc3339()),
         account_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jwt_with_claims(claims: serde_json::Value) -> String {
+        let header = serde_json::json!({"alg":"none"});
+        format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        )
+    }
+
+    #[test]
+    fn parse_codex_auth_json_prefers_chatgpt_account_id_from_id_token() {
+        let access_token = jwt_with_claims(serde_json::json!({"sub":"access-sub"}));
+        let id_token = jwt_with_claims(serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id":"acct_123"}
+        }));
+        let raw = serde_json::json!({
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "refresh",
+                "id_token": {"raw_jwt": id_token}
+            },
+            "last_refresh": "2026-01-01T00:00:00Z"
+        });
+
+        let parsed = parse_auth_tokens(&raw.to_string()).unwrap();
+
+        assert_eq!(parsed.account_id.as_deref(), Some("acct_123"));
+        assert_eq!(parsed.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    #[test]
+    fn device_interval_accepts_string_or_number() {
+        let from_string: DeviceCodeResp = serde_json::from_value(serde_json::json!({
+            "device_auth_id": "dev",
+            "user_code": "CODE",
+            "interval": "7"
+        }))
+        .unwrap();
+        let from_number: DeviceCodeResp = serde_json::from_value(serde_json::json!({
+            "device_auth_id": "dev",
+            "user_code": "CODE",
+            "interval": 3
+        }))
+        .unwrap();
+
+        assert_eq!(from_string.interval, 7);
+        assert_eq!(from_number.interval, 3);
+    }
 }
 
 fn random_state() -> String {

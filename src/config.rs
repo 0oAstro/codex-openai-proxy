@@ -12,7 +12,8 @@ pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
 pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 pub const UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/codex";
-pub const SCOPES: &str = "openid profile email offline_access";
+pub const SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
 /// Auth file lives directly at `~/auth.json`.
 pub const AUTH_FILE: &str = "auth.json";
 pub const AUTH_FILE_ENV: &str = "CODEX_AUTH_FILE";
@@ -33,7 +34,12 @@ pub const MODELS_CACHE_TTL_SECS: u64 = 300; // 5 minutes
 pub const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 
 /// Built-in models to force-inject into the models list (not returned by upstream).
-pub const BUILTIN_MODELS: &[&str] = &["gpt-image-2"];
+pub const BUILTIN_MODELS: &[&str] = &[
+    "gpt-image-2",
+    "gpt-image-1.5",
+    "gpt-image-1",
+    "gpt-image-1-mini",
+];
 
 /// Read the proxy API key from the `PROXY_API_KEY` env var.
 /// If set, all requests (except /health) require `Authorization: Bearer <key>`.
@@ -57,6 +63,18 @@ pub fn auth_file_path() -> PathBuf {
     dirs_home().join(AUTH_FILE)
 }
 
+/// Originator used by the official Codex CLI for ChatGPT backend calls.
+pub const ORIGINATOR: &str = "codex_cli_rs";
+
+/// Build a Codex-compatible User-Agent. Matches the current Rust Codex client
+/// shape closely enough for ChatGPT backend feature gates while remaining
+/// deterministic in containers.
+pub fn codex_user_agent_for_version(version: &str) -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    format!("{ORIGINATOR}/{version} ({os}; {arch})")
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -78,7 +96,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(port: u16, version: String) -> Self {
-        let user_agent = format!("codex-tui/{version} (Mac OS 26.3.1; arm64)");
+        let user_agent = codex_user_agent_for_version(&version);
         let http = reqwest::Client::builder()
             .user_agent(&user_agent)
             .build()
@@ -131,7 +149,7 @@ pub async fn fetch_latest_codex_version() -> String {
 /// Update the version stored in AppState (called by background task).
 async fn update_version(state: &Arc<AppState>) {
     let version = fetch_latest_codex_version().await;
-    let user_agent = format!("codex-tui/{version} (Mac OS 26.3.1; arm64)");
+    let user_agent = codex_user_agent_for_version(&version);
     {
         let mut cv = state.client_version.write().await;
         *cv = version.clone();

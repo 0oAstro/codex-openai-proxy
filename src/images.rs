@@ -4,9 +4,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use base64::Engine;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
-use base64::Engine;
 use serde_json::Value;
 use tracing::{debug, error, info};
 
@@ -266,41 +266,43 @@ fn extract_images_from_completed(payload: &Value) -> Vec<ImageCallResult> {
 
     arr.iter()
         .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("image_generation_call"))
-        .filter_map(|item| {
-            let result = item.get("result")?.as_str()?.to_string();
-            if result.trim().is_empty() {
-                return None;
-            }
-            Some(ImageCallResult {
-                result,
-                revised_prompt: item
-                    .get("revised_prompt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                output_format: item
-                    .get("output_format")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                size: item
-                    .get("size")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                background: item
-                    .get("background")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                quality: item
-                    .get("quality")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            })
-        })
+        .filter_map(extract_image_call_result)
         .collect()
+}
+
+fn extract_image_call_result(item: &Value) -> Option<ImageCallResult> {
+    let result = item.get("result")?.as_str()?.to_string();
+    if result.trim().is_empty() {
+        return None;
+    }
+    Some(ImageCallResult {
+        result,
+        revised_prompt: item
+            .get("revised_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        output_format: item
+            .get("output_format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        size: item
+            .get("size")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        background: item
+            .get("background")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        quality: item
+            .get("quality")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
 }
 
 fn extract_usage(payload: &Value) -> Option<Value> {
@@ -411,7 +413,7 @@ async fn send_responses_request(
     };
 
     let mut auth_headers = build_auth_headers(&auth, &state.codex_user_agent().await);
-    for key in &["openai-beta", "openai-organization"] {
+    for key in &["openai-beta", "openai-organization", "openai-project"] {
         if let Some(val) = headers.get(*key) {
             auth_headers.insert(*key, val.clone());
         }
@@ -455,8 +457,9 @@ async fn retry_on_401(
         if let Some(rt) = tokens.refresh_token.clone() {
             match crate::auth::refresh_token(&rt).await {
                 Ok(refreshed) => {
-                    let mut auth_headers = build_auth_headers(&refreshed, &state.codex_user_agent().await);
-                    for key in &["openai-beta", "openai-organization"] {
+                    let mut auth_headers =
+                        build_auth_headers(&refreshed, &state.codex_user_agent().await);
+                    for key in &["openai-beta", "openai-organization", "openai-project"] {
                         if let Some(val) = headers.get(*key) {
                             auth_headers.insert(*key, val.clone());
                         }
@@ -486,15 +489,15 @@ async fn retry_on_401(
         }
     }
 
-    Err(error_response(StatusCode::UNAUTHORIZED, "Token refresh failed"))
+    Err(error_response(
+        StatusCode::UNAUTHORIZED,
+        "Token refresh failed",
+    ))
 }
 
 // ── Non-streaming collector ───────────────────────────────────────────────
 
-async fn collect_images(
-    upstream: reqwest::Response,
-    response_format: &str,
-) -> Response {
+async fn collect_images(upstream: reqwest::Response, response_format: &str) -> Response {
     let status = upstream.status();
     if !status.is_success() {
         let body = upstream.text().await.unwrap_or_default();
@@ -528,11 +531,26 @@ async fn collect_images(
         };
 
         if event["type"].as_str() == Some("response.completed") {
-            if let Some(ts) = event.get("response").and_then(|r| r.get("created_at")).and_then(|v| v.as_u64()) {
+            if let Some(ts) = event
+                .get("response")
+                .and_then(|r| r.get("created_at"))
+                .and_then(|v| v.as_u64())
+            {
                 created = ts;
             }
-            results = extract_images_from_completed(&event);
+            let completed_results = extract_images_from_completed(&event);
+            if !completed_results.is_empty() {
+                results = completed_results;
+            }
             usage = extract_usage(&event);
+        } else if event["type"].as_str() == Some("response.output_item.done") {
+            if let Some(item) = event.get("item") {
+                if item.get("type").and_then(|t| t.as_str()) == Some("image_generation_call") {
+                    if let Some(result) = extract_image_call_result(item) {
+                        results.push(result);
+                    }
+                }
+            }
         }
     }
 
@@ -624,16 +642,43 @@ async fn stream_images(
 
                     output.push_str(&format!("event: {event_name}\ndata: {payload}\n\n"));
                 }
+                "response.output_item.done" => {
+                    let item = match event.get("item") {
+                        Some(item)
+                            if item.get("type").and_then(|t| t.as_str())
+                                == Some("image_generation_call") =>
+                        {
+                            item
+                        }
+                        _ => continue,
+                    };
+                    let img = match extract_image_call_result(item) {
+                        Some(img) => img,
+                        None => continue,
+                    };
+
+                    let event_name = format!("{stream_prefix}.completed");
+                    let mut payload = serde_json::json!({
+                        "type": event_name,
+                    });
+                    if response_format == "url" {
+                        let mt = mime_type_from_output_format(&img.output_format);
+                        payload["url"] =
+                            Value::String(format!("data:{};base64,{}", mt, img.result));
+                    } else {
+                        payload["b64_json"] = Value::String(img.result);
+                    }
+                    if !img.revised_prompt.is_empty() {
+                        payload["revised_prompt"] = Value::String(img.revised_prompt);
+                    }
+                    output.push_str(&format!("event: {event_name}\ndata: {payload}\n\n"));
+                }
                 "response.completed" => {
                     let results = extract_images_from_completed(&event);
                     let usage = extract_usage(&event);
 
                     if results.is_empty() {
-                        let err_payload =
-                            serde_json::json!({"error": {"message": "Upstream did not return image output"}});
-                        output.push_str(&format!(
-                            "event: error\ndata: {err_payload}\n\n"
-                        ));
+                        debug!("response.completed had no image output; output_item.done may have carried it");
                         continue;
                     }
 
@@ -741,7 +786,12 @@ pub async fn handle_images_edits(
 
     let body = match axum::body::to_bytes(raw_request.into_body(), 10 * 1024 * 1024).await {
         Ok(b) => b,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("Failed to read body: {e}")),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read body: {e}"),
+            )
+        }
     };
 
     if ct.contains("application/json") {
@@ -773,10 +823,7 @@ async fn handle_images_edits_json_inner(
         .collect();
 
     if images.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "images[].image_url is required",
-        );
+        return error_response(StatusCode::BAD_REQUEST, "images[].image_url is required");
     }
 
     let image_model = resolve_image_model(req.model.as_deref());
@@ -878,7 +925,8 @@ async fn handle_images_edits_multipart_inner(
         .map(|v| resolve_image_model(Some(v)))
         .unwrap_or_else(|| DEFAULT_IMAGES_TOOL_MODEL.to_string());
     let main_model = resolve_main_model(&image_model);
-    let response_format = resolve_response_format(fields.get("response_format").map(|s| s.as_str()));
+    let response_format =
+        resolve_response_format(fields.get("response_format").map(|s| s.as_str()));
     let stream = fields
         .get("stream")
         .and_then(|v| v.trim().parse::<bool>().ok())
@@ -935,7 +983,10 @@ fn extract_boundary(content_type: &str) -> Option<String> {
 
 /// Minimal multipart parser. Extracts text fields and converts file uploads
 /// to data URLs (base64-encoded).
-fn parse_multipart(body: &[u8], boundary: &str) -> Result<std::collections::HashMap<String, String>, String> {
+fn parse_multipart(
+    body: &[u8],
+    boundary: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
     let body_str = String::from_utf8_lossy(body);
     let delimiter = format!("--{boundary}");
     let mut fields = std::collections::HashMap::new();
@@ -979,7 +1030,10 @@ fn parse_multipart(body: &[u8], boundary: &str) -> Result<std::collections::Hash
         };
 
         // Strip trailing \r\n-- (boundary closing)
-        let body_text = body_section.trim_end_matches("\r\n").trim_end_matches("--").trim_end_matches("\r\n");
+        let body_text = body_section
+            .trim_end_matches("\r\n")
+            .trim_end_matches("--")
+            .trim_end_matches("\r\n");
 
         if is_file {
             let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
@@ -1002,12 +1056,54 @@ fn extract_attr(header: &str, attr: &str) -> Option<String> {
     Some(header[value_start..value_start + value_end].to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_image_from_output_item_done_shape() {
+        let event = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "ig_123",
+                "type": "image_generation_call",
+                "status": "completed",
+                "action": "generate",
+                "background": "opaque",
+                "output_format": "png",
+                "quality": "medium",
+                "result": "abc123",
+                "revised_prompt": "tiny icon",
+                "size": "1024x1024"
+            }
+        });
+
+        let image = extract_image_call_result(event.get("item").unwrap()).unwrap();
+
+        assert_eq!(image.result, "abc123");
+        assert_eq!(image.output_format, "png");
+        assert_eq!(image.revised_prompt, "tiny icon");
+        assert_eq!(image.size, "1024x1024");
+    }
+
+    #[test]
+    fn completed_without_output_is_allowed_for_image_events() {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "output": []
+            }
+        });
+
+        assert!(extract_images_from_completed(&event).is_empty());
+    }
+}
+
 // ── Auth helper ───────────────────────────────────────────────────────────
 
 async fn load_and_refresh_auth() -> Result<crate::auth::AuthTokens, String> {
-    let tokens = crate::auth::AuthTokens::load().ok_or_else(|| {
-        "Not authenticated. Run `codex-openai-proxy login`.".to_string()
-    })?;
+    let tokens = crate::auth::AuthTokens::load()
+        .ok_or_else(|| "Not authenticated. Run `codex-openai-proxy login`.".to_string())?;
     crate::auth::ensure_valid_token(tokens)
         .await
         .map_err(|e: anyhow::Error| e.to_string())

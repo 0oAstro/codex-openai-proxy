@@ -45,7 +45,7 @@ pub async fn handle_responses(
             .expect("valid header value"),
     );
     // Copy selected headers from the incoming request (e.g. OpenAI-Beta, OpenAI-Organization).
-    for key in &["openai-beta", "openai-organization"] {
+    for key in &["openai-beta", "openai-organization", "openai-project"] {
         if let Some(val) = headers.get(*key) {
             auth_headers.insert(*key, val.clone());
         }
@@ -91,7 +91,7 @@ pub async fn handle_responses(
                                 .parse()
                                 .expect("valid header value"),
                         );
-                        for key in &["openai-beta", "openai-organization"] {
+                        for key in &["openai-beta", "openai-organization", "openai-project"] {
                             if let Some(val) = headers.get(*key) {
                                 retry_headers.insert(*key, val.clone());
                             }

@@ -24,7 +24,16 @@ CLI output, HTTP responses, debug logs, tests, fixtures, or documentation.
 - The proxy's client-facing API key is separate from upstream ChatGPT/Codex
   credentials. Do not mix the two auth domains.
 - Token refresh must use the stored refresh token only for upstream
-  authentication recovery.
+  authentication recovery, using the Codex-compatible JSON refresh-token
+  request shape against `https://auth.openai.com/oauth/token`.
+
+## Upstream Identity Headers
+
+Outbound ChatGPT/Codex requests use `Authorization: Bearer <access_token>`,
+`chatgpt-account-id` from `chatgpt_account_id` in the ID token when present,
+Codex `originator`, `version`, and `User-Agent` headers. Client-supplied
+OpenAI organization/project headers may be forwarded, but bearer credentials
+must always come from the local auth file.
 
 ## Logging
 

@@ -21,10 +21,12 @@ explicitly revised.
 1. `src/main.rs` parses CLI arguments and builds the Axum router.
 2. Middleware applies proxy API-key auth when `PROXY_API_KEY` is set. `/health`
    remains unauthenticated.
-3. Route handlers load or refresh ChatGPT/Codex credentials as needed.
+3. Route handlers load or refresh ChatGPT/Codex credentials as needed. Refresh follows Codex
+   JSON OAuth refresh semantics; browser and device-code login use the Codex client ID,
+   originator, connector scopes, and organization-bearing ID tokens.
 4. Handlers translate OpenAI-compatible inputs where required, call upstream
-   APIs with Codex-compatible headers, and stream or collect responses back to
-   the client.
+   APIs with Codex-compatible headers (`originator`, `version`, `User-Agent`,
+   `chatgpt-account-id`), and stream or collect responses back to the client.
 
 ## Module Ownership
 
@@ -41,7 +43,10 @@ explicitly revised.
 - `src/chat.rs`: `/v1/chat/completions` translation, reasoning suffix parsing,
   tool/function call conversion, and streaming chunk generation.
 - `src/images.rs`: OpenAI-compatible image generation and edit endpoint
-  handling.
+  handling. Image routes build Codex Responses API image-generation tool requests,
+  consume `response.image_generation_call.partial_image`,
+  `response.output_item.done`, and `response.completed` SSE shapes, then convert
+  final image base64 into OpenAI image response fields.
 - `src/usage.rs`: usage endpoint handling when present in the working tree.
 
 ## Boundary Rules

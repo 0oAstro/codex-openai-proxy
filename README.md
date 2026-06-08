@@ -4,9 +4,9 @@ Proxy your ChatGPT/Codex subscription as an OpenAI-compatible API.
 
 ## Features
 
-- **OpenAI-compatible endpoints**: `/v1/models`, `/v1/responses`, `/v1/chat/completions`
+- **OpenAI-compatible endpoints**: `/v1/models`, `/v1/responses`, `/v1/chat/completions`, `/v1/images/generations`, `/v1/images/edits`
 - **Usage metrics**: `/usage` returns Codex rate-limit and credit snapshots
-- **OAuth PKCE login**: browser-based authentication with automatic token refresh
+- **OAuth PKCE + device-code login**: browser-based or headless ChatGPT authentication with automatic token refresh
 - **Streaming support**: SSE streaming for both responses and chat completions
 - **Chat completions translation**: translates OpenAI chat format to/from Codex Responses API
 - **Reasoning effort**: parse model name suffixes (e.g. `gpt-5.5-xhigh`) into reasoning parameters
@@ -22,6 +22,9 @@ cargo build --release
 
 # Log in (opens browser)
 ./target/release/codex-openai-proxy login
+
+# Or log in from SSH/headless hosts
+./target/release/codex-openai-proxy login-device
 
 # Start the proxy
 ./target/release/codex-openai-proxy serve
@@ -54,6 +57,9 @@ PORT=3000 codex-openai-proxy serve
 # Browser login (OAuth PKCE)
 codex-openai-proxy login
 
+# Headless login (ChatGPT device code flow)
+codex-openai-proxy login-device
+
 # Check status
 codex-openai-proxy auth status
 
@@ -61,7 +67,7 @@ codex-openai-proxy auth status
 codex-openai-proxy logout
 ```
 
-Credentials are stored in `~/auth.json` by default. Set `CODEX_AUTH_FILE` to use a different path.
+Credentials are stored in `~/auth.json` by default and are compatible with Codex `auth.json` files. Set `CODEX_AUTH_FILE` to use a different path. The OAuth requests mirror Codex: `originator=codex_cli_rs`, connector scopes, organization-bearing ID tokens, JSON refresh requests, and `chatgpt_account_id` extraction for upstream `chatgpt-account-id`.
 
 ## API Endpoints
 
@@ -81,6 +87,9 @@ Passthrough to the Codex Responses API. Streams SSE response back verbatim.
 Translates OpenAI chat completions format to Codex Responses API and back.
 Supports both streaming (`"stream": true`) and non-streaming modes.
 
+### `POST /v1/images/generations` and `POST /v1/images/edits`
+Translates OpenAI-compatible image generation/edit requests to Codex Responses API image-generation tools. The proxy sends the same backend family used by Codex (`https://chatgpt.com/backend-api/codex/responses`) and converts `image_generation_call` SSE output into OpenAI image response data.
+
 #### Reasoning effort
 Append a reasoning suffix to the model name:
 ```
@@ -99,7 +108,7 @@ docker network create main-network
 docker compose up -d
 ```
 
-The container mounts `/opt/codex-openai-proxy/auth.json` from the host to `/root/auth.json` in the container.
+The container mounts `/opt/codex-openai-proxy/auth.json` from the host and sets `CODEX_AUTH_FILE=/opt/codex-openai-proxy/auth.json`. Run `codex-openai-proxy login-device` on the host or copy an existing Codex-compatible `auth.json` there before starting the service.
 
 ## Example: Using with OpenAI SDK
 

@@ -439,8 +439,10 @@ fn build_responses_body(req: &ChatRequest) -> Value {
             }
             Value::Object(obj) => {
                 if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
-                    if let Some(fname) =
-                        obj.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str())
+                    if let Some(fname) = obj
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
                     {
                         body["tool_choice"] =
                             serde_json::json!({"type": "function", "name": fname});
@@ -500,7 +502,7 @@ pub async fn handle_chat_completions(
             .parse()
             .expect("valid header value"),
     );
-    for key in &["openai-beta", "openai-organization"] {
+    for key in &["openai-beta", "openai-organization", "openai-project"] {
         if let Some(val) = headers.get(*key) {
             auth_headers.insert(*key, val.clone());
         }
@@ -541,7 +543,7 @@ pub async fn handle_chat_completions(
                                 .parse()
                                 .expect("valid header value"),
                         );
-                        for key in &["openai-beta", "openai-organization"] {
+                        for key in &["openai-beta", "openai-organization", "openai-project"] {
                             if let Some(val) = headers.get(*key) {
                                 retry_headers.insert(*key, val.clone());
                             }
@@ -638,7 +640,13 @@ async fn handle_streaming(
 
                     sent_eof_done = true;
                     let finish_reason = if saw_tool_call { "tool_calls" } else { "stop" };
-                    let output = final_stream_chunk(&resp_id, &model, None, finish_reason, stream_include_usage);
+                    let output = final_stream_chunk(
+                        &resp_id,
+                        &model,
+                        None,
+                        finish_reason,
+                        stream_include_usage,
+                    );
                     return Some((
                         Ok::<Bytes, std::io::Error>(Bytes::from(output)),
                         (
@@ -936,12 +944,24 @@ fn translate_stream_chunk(
                     completed = true;
                     let usage = event.get("response").and_then(|r| r.get("usage"));
                     let finish_reason = if tool_call_seen { "tool_calls" } else { "stop" };
-                    output.push_str(&final_stream_chunk(resp_id, model, usage, finish_reason, stream_include_usage));
+                    output.push_str(&final_stream_chunk(
+                        resp_id,
+                        model,
+                        usage,
+                        finish_reason,
+                        stream_include_usage,
+                    ));
                 }
                 "response.incomplete" => {
                     completed = true;
                     let usage = event.get("response").and_then(|r| r.get("usage"));
-                    output.push_str(&final_stream_chunk(resp_id, model, usage, "length", stream_include_usage));
+                    output.push_str(&final_stream_chunk(
+                        resp_id,
+                        model,
+                        usage,
+                        "length",
+                        stream_include_usage,
+                    ));
                 }
                 _ => {
                     // Forward unknown events as-is (helps debugging).

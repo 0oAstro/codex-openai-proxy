@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use crate::config::{AppState, UPSTREAM_BASE};
+use crate::config::{AppState, ORIGINATOR, UPSTREAM_BASE};
 
 // ── Response types ────────────────────────────────────────────────────────
 
@@ -203,12 +203,18 @@ pub fn build_auth_headers(tokens: &crate::auth::AuthTokens, user_agent: &str) ->
         "application/json".parse().expect("valid header value"),
     );
     headers.insert(
+        "version",
+        env!("CARGO_PKG_VERSION")
+            .parse()
+            .expect("valid header value"),
+    );
+    headers.insert(
         axum::http::header::USER_AGENT,
         user_agent.parse().expect("valid header value"),
     );
     headers.insert(
         "originator",
-        "codex-tui".parse().expect("valid header value"),
+        ORIGINATOR.parse().expect("valid header value"),
     );
     headers
 }
