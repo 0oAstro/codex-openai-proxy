@@ -31,7 +31,7 @@ enum Commands {
         /// Bind address
         #[arg(long, default_value = "0.0.0.0")]
         host: String,
-        /// Pin a specific Codex client version (otherwise fetched from npm)
+        /// Pin a specific Codex client version (otherwise fetched from npm/CODEX_CLIENT_VERSION)
         #[arg(long)]
         codex_version: Option<String>,
     },

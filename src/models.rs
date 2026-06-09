@@ -168,7 +168,8 @@ pub async fn handle_models(
         .map_err(|e: anyhow::Error| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))?;
 
     let user_agent = state.codex_user_agent().await;
-    let auth_headers = build_auth_headers(&auth, &user_agent);
+    let version = state.client_version().await;
+    let auth_headers = build_auth_headers(&auth, &user_agent, &version);
 
     let models = state
         .models_cache
@@ -184,7 +185,11 @@ pub async fn handle_models(
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-pub fn build_auth_headers(tokens: &crate::auth::AuthTokens, user_agent: &str) -> HeaderMap {
+pub fn build_auth_headers(
+    tokens: &crate::auth::AuthTokens,
+    user_agent: &str,
+    client_version: &str,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::AUTHORIZATION,
@@ -210,9 +215,7 @@ pub fn build_auth_headers(tokens: &crate::auth::AuthTokens, user_agent: &str) ->
     );
     headers.insert(
         "version",
-        env!("CARGO_PKG_VERSION")
-            .parse()
-            .expect("valid header value"),
+        client_version.parse().expect("valid header value"),
     );
     headers.insert(
         axum::http::header::USER_AGENT,

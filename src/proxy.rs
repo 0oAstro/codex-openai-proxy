@@ -36,7 +36,9 @@ pub async fn handle_responses(
         }
     };
 
-    let mut auth_headers = build_auth_headers(&auth, &state.codex_user_agent().await);
+    let user_agent = state.codex_user_agent().await;
+    let version = state.client_version().await;
+    let mut auth_headers = build_auth_headers(&auth, &user_agent, &version);
     // Always send OpenAI-Beta header for the Responses API.
     auth_headers.insert(
         "openai-beta",
@@ -79,7 +81,8 @@ pub async fn handle_responses(
                 match crate::auth::refresh_token(&rt).await {
                     Ok(refreshed) => {
                         let ua = state.codex_user_agent().await;
-                        let mut retry_headers = build_auth_headers(&refreshed, &ua);
+                        let version = state.client_version().await;
+                        let mut retry_headers = build_auth_headers(&refreshed, &ua, &version);
                         retry_headers.insert(
                             "openai-beta",
                             "responses=experimental"

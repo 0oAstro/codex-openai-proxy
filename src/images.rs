@@ -408,7 +408,9 @@ async fn send_responses_request(
         }
     };
 
-    let mut auth_headers = build_auth_headers(&auth, &state.codex_user_agent().await);
+    let user_agent = state.codex_user_agent().await;
+    let version = state.client_version().await;
+    let mut auth_headers = build_auth_headers(&auth, &user_agent, &version);
     copy_codex_passthrough_headers(headers, &mut auth_headers);
     auth_headers.insert(
         axum::http::header::ACCEPT,
@@ -453,8 +455,11 @@ async fn retry_on_401(
         if let Some(rt) = tokens.refresh_token.clone() {
             match crate::auth::refresh_token(&rt).await {
                 Ok(refreshed) => {
-                    let mut auth_headers =
-                        build_auth_headers(&refreshed, &state.codex_user_agent().await);
+                    let mut auth_headers = build_auth_headers(
+                        &refreshed,
+                        &state.codex_user_agent().await,
+                        &state.client_version().await,
+                    );
                     copy_codex_passthrough_headers(headers, &mut auth_headers);
                     auth_headers.insert(
                         axum::http::header::ACCEPT,

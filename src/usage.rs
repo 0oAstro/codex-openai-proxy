@@ -60,7 +60,7 @@ pub async fn handle_usage(
         .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
 
     let user_agent = state.codex_user_agent().await;
-    let mut auth_headers = build_auth_headers(&auth, &user_agent);
+    let mut auth_headers = build_auth_headers(&auth, &user_agent, &state.client_version().await);
     auth_headers.insert(
         "openai-beta",
         "responses=experimental"

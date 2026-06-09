@@ -231,9 +231,14 @@ pub async fn make_state(port: u16, version_override: Option<String>) -> Arc<AppS
             v
         }
         None => {
-            let v = fetch_latest_codex_version().await;
-            info!("Using Codex client version: {v}");
-            v
+            if let Ok(v) = std::env::var("CODEX_CLIENT_VERSION") {
+                info!("Using pinned Codex client version from CODEX_CLIENT_VERSION: {v}");
+                v
+            } else {
+                let v = fetch_latest_codex_version().await;
+                info!("Using Codex client version: {v}");
+                v
+            }
         }
     };
     Arc::new(AppState::new(port, version))
