@@ -67,7 +67,7 @@ codex-openai-proxy auth status
 codex-openai-proxy logout
 ```
 
-Credentials are stored in `~/auth.json` by default and are compatible with Codex `auth.json` files. Set `CODEX_AUTH_FILE` to use a different path. The OAuth requests mirror Codex: `originator=codex_cli_rs`, connector scopes, organization-bearing ID tokens, JSON refresh requests, and `chatgpt_account_id` extraction for upstream `chatgpt-account-id`.
+Credentials are stored in `~/auth.json` by default and are compatible with Codex `auth.json` files. Set `CODEX_AUTH_FILE` to use a different primary path. Set `CODEX_AUTH_FILES` to a comma-separated fallback list, for example `CODEX_AUTH_FILES=/path/to/auth-primary.json,/path/to/auth-backup.json`; the proxy tries accounts in order and falls back on upstream auth, quota, and rate-limit failures. The OAuth requests mirror Codex: `originator=codex_cli_rs`, connector scopes, organization-bearing ID tokens, JSON refresh requests, and `chatgpt_account_id` extraction for upstream `chatgpt-account-id`.
 
 ## API Endpoints
 
@@ -108,7 +108,7 @@ docker network create main-network
 docker compose up -d
 ```
 
-The container mounts `/opt/codex-openai-proxy/auth.json` read-write and sets `CODEX_AUTH_FILE=/opt/codex-openai-proxy/auth.json` so automatic token refresh can persist refreshed tokens. Run `codex-openai-proxy login-device` on the host or copy an existing Codex-compatible `auth.json` there before starting the service.
+The container mounts `/opt/codex-openai-proxy/auth.json` read-write and sets `CODEX_AUTH_FILE=/opt/codex-openai-proxy/auth.json` so automatic token refresh can persist refreshed tokens. Add extra mounted auth files with `CODEX_AUTH_FILES` if you want account fallback. Run `codex-openai-proxy login-device` on the host or copy an existing Codex-compatible `auth.json` there before starting the service.
 
 ## Example: Using with OpenAI SDK
 

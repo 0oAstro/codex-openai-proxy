@@ -25,7 +25,7 @@ pub async fn handle_responses(
 ) -> Response {
     let (upstream_body, stream_requested) = sanitize_responses_body(&body);
 
-    let auth = match load_and_refresh_auth().await {
+    let auth_candidates = match load_and_refresh_auth().await {
         Ok(a) => a,
         Err(e) => {
             return (
@@ -36,90 +36,131 @@ pub async fn handle_responses(
         }
     };
 
-    let user_agent = state.codex_user_agent().await;
-    let version = state.client_version().await;
-    let mut auth_headers = build_auth_headers(&auth, &user_agent, &version);
-    // Always send OpenAI-Beta header for the Responses API.
-    auth_headers.insert(
-        "openai-beta",
-        "responses=experimental"
-            .parse()
-            .expect("valid header value"),
-    );
-    copy_codex_passthrough_headers(&headers, &mut auth_headers);
-
     let url = format!("{}/responses", crate::config::UPSTREAM_BASE);
     debug!("Proxying to upstream: {url}");
+    let mut last_error: Option<(StatusCode, String)> = None;
 
-    let resp = match state
-        .http
-        .post(&url)
-        .headers(auth_headers.clone())
-        .body(upstream_body.clone())
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Upstream request error: {e}");
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("{{\"error\":{{\"message\":\"Upstream request failed: {e}\"}}}}"),
-            )
-                .into_response();
-        }
-    };
+    for (idx, auth) in auth_candidates.iter().enumerate() {
+        let has_next = idx + 1 < auth_candidates.len();
+        let account = auth.account_label();
+        let user_agent = state.codex_user_agent().await;
+        let version = state.client_version().await;
+        let mut auth_headers = build_auth_headers(auth, &user_agent, &version);
+        // Always send OpenAI-Beta header for the Responses API.
+        auth_headers.insert(
+            "openai-beta",
+            "responses=experimental"
+                .parse()
+                .expect("valid header value"),
+        );
+        copy_codex_passthrough_headers(&headers, &mut auth_headers);
 
-    let status = resp.status();
-    debug!("Upstream responded with {status}");
+        let mut resp = match state
+            .http
+            .post(&url)
+            .headers(auth_headers.clone())
+            .body(upstream_body.clone())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Upstream request error for {account}: {e}");
+                if has_next {
+                    last_error = Some((
+                        StatusCode::BAD_GATEWAY,
+                        format!("Upstream request failed: {e}"),
+                    ));
+                    continue;
+                }
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("{{\"error\":{{\"message\":\"Upstream request failed: {e}\"}}}}"),
+                )
+                    .into_response();
+            }
+        };
 
-    // If we got a 401, attempt one token refresh then retry.
-    if status == StatusCode::UNAUTHORIZED {
-        info!("Received 401, attempting token refresh…");
-        if let Some(tokens) = crate::auth::AuthTokens::load() {
-            if let Some(rt) = tokens.refresh_token.clone() {
-                match crate::auth::refresh_token(&rt).await {
-                    Ok(refreshed) => {
-                        let ua = state.codex_user_agent().await;
-                        let version = state.client_version().await;
-                        let mut retry_headers = build_auth_headers(&refreshed, &ua, &version);
-                        retry_headers.insert(
-                            "openai-beta",
-                            "responses=experimental"
-                                .parse()
-                                .expect("valid header value"),
-                        );
-                        copy_codex_passthrough_headers(&headers, &mut retry_headers);
-
-                        let retry_resp = match state
-                            .http
-                            .post(&url)
-                            .headers(retry_headers)
-                            .body(upstream_body.clone())
-                            .send()
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                return (
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            info!("Received 401 for {account}, attempting token refresh...");
+            match crate::auth::refresh_existing_token(auth).await {
+                Ok(refreshed) => {
+                    let ua = state.codex_user_agent().await;
+                    let version = state.client_version().await;
+                    let mut retry_headers = build_auth_headers(&refreshed, &ua, &version);
+                    retry_headers.insert(
+                        "openai-beta",
+                        "responses=experimental"
+                            .parse()
+                            .expect("valid header value"),
+                    );
+                    copy_codex_passthrough_headers(&headers, &mut retry_headers);
+                    match state
+                        .http
+                        .post(&url)
+                        .headers(retry_headers)
+                        .body(upstream_body.clone())
+                        .send()
+                        .await
+                    {
+                        Ok(r) => resp = r,
+                        Err(e) => {
+                            if has_next {
+                                last_error = Some((
                                     StatusCode::BAD_GATEWAY,
-                                    format!("{{\"error\":{{\"message\":\"Retry upstream request failed: {e}\"}}}}"),
-                                )
-                                    .into_response();
+                                    format!("Retry upstream request failed: {e}"),
+                                ));
+                                continue;
                             }
-                        };
-
-                        return stream_response(retry_resp, stream_requested).await;
-                    }
-                    Err(e) => {
-                        error!("Token refresh failed: {e}");
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                format!("{{\"error\":{{\"message\":\"Retry upstream request failed: {e}\"}}}}"),
+                            )
+                                .into_response();
+                        }
                     }
                 }
+                Err(e) => error!("Token refresh failed for {account}: {e}"),
             }
         }
+
+        let status = resp.status();
+        debug!("Upstream responded with {status} for {account}");
+        if status.is_success() {
+            return stream_response(resp, stream_requested).await;
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        error!("Upstream error for {account} ({status}): {body}");
+        if has_next && crate::auth::should_fallback_status(status) {
+            info!("Falling back from {account} after upstream status {status}");
+            last_error = Some((status, body));
+            continue;
+        }
+        return (
+            status,
+            format!(
+                "{{\"error\":{{\"message\":{}}}}}",
+                serde_json::to_string(&body).unwrap_or_default()
+            ),
+        )
+            .into_response();
     }
 
-    stream_response(resp, stream_requested).await
+    let (status, body) = last_error.unwrap_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "No configured auth accounts are usable".to_string(),
+        )
+    });
+    (
+        status,
+        format!(
+            "{{\"error\":{{\"message\":{}}}}}",
+            serde_json::to_string(&body).unwrap_or_default()
+        ),
+    )
+        .into_response()
 }
 
 /// Stream an upstream response back to the client, proxying the status code
@@ -409,12 +450,8 @@ fn sanitize_responses_body(body: &[u8]) -> (Vec<u8>, bool) {
     )
 }
 
-async fn load_and_refresh_auth() -> Result<crate::auth::AuthTokens, String> {
-    let tokens = crate::auth::AuthTokens::load()
-        .ok_or_else(|| "Not authenticated. Run `codex-openai-proxy login`.".to_string())?;
-    crate::auth::ensure_valid_token(tokens)
-        .await
-        .map_err(|e: anyhow::Error| e.to_string())
+async fn load_and_refresh_auth() -> Result<Vec<crate::auth::AuthTokens>, String> {
+    crate::auth::load_and_refresh_auth_candidates().await
 }
 
 #[cfg(test)]

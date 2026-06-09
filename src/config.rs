@@ -18,6 +18,7 @@ pub const SCOPES: &str =
 /// Auth file lives directly at `~/auth.json`.
 pub const AUTH_FILE: &str = "auth.json";
 pub const AUTH_FILE_ENV: &str = "CODEX_AUTH_FILE";
+pub const AUTH_FILES_ENV: &str = "CODEX_AUTH_FILES";
 
 /// Fallback version if dynamic fetch fails.
 pub const FALLBACK_CLIENT_VERSION: &str = "0.125.0";
@@ -62,6 +63,57 @@ pub fn auth_file_path() -> PathBuf {
     }
 
     dirs_home().join(AUTH_FILE)
+}
+
+/// Resolve all configured ChatGPT OAuth token files in fallback order.
+///
+/// `CODEX_AUTH_FILES` is a comma-separated list. `CODEX_AUTH_FILE` remains the
+/// primary login/logout target and is prepended when not already listed.
+pub fn auth_file_paths() -> Vec<PathBuf> {
+    auth_file_paths_from_env(
+        dirs_home(),
+        std::env::var(AUTH_FILE_ENV).ok(),
+        std::env::var(AUTH_FILES_ENV).ok(),
+    )
+}
+
+pub(crate) fn auth_file_paths_from_env(
+    home: PathBuf,
+    auth_file: Option<String>,
+    auth_files: Option<String>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(primary) = auth_file {
+        push_unique_path(&mut paths, resolve_auth_path(&home, primary));
+    }
+    if let Some(list) = auth_files {
+        for raw in list.split(',') {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            push_unique_path(&mut paths, resolve_auth_path(&home, raw.to_string()));
+        }
+    }
+    if paths.is_empty() {
+        paths.push(home.join(AUTH_FILE));
+    }
+    paths
+}
+
+fn resolve_auth_path(home: &std::path::Path, raw: String) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        home.join(path)
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
 /// Originator used by the official Codex CLI for ChatGPT backend calls.
@@ -242,4 +294,35 @@ pub async fn make_state(port: u16, version_override: Option<String>) -> Arc<AppS
         }
     };
     Arc::new(AppState::new(port, version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_file_paths_prepends_primary_and_deduplicates_fallbacks() {
+        let home = PathBuf::from("/home/tester");
+        let paths = auth_file_paths_from_env(
+            home,
+            Some("primary.json".to_string()),
+            Some("/abs/backup.json, primary.json, relative/backup.json,,".to_string()),
+        );
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/home/tester/primary.json"),
+                PathBuf::from("/abs/backup.json"),
+                PathBuf::from("/home/tester/relative/backup.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_file_paths_defaults_to_home_auth_json() {
+        let paths = auth_file_paths_from_env(PathBuf::from("/home/tester"), None, None);
+
+        assert_eq!(paths, vec![PathBuf::from("/home/tester/auth.json")]);
+    }
 }

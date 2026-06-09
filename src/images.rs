@@ -401,81 +401,96 @@ async fn send_responses_request(
     headers: &HeaderMap,
     body: &Value,
 ) -> Result<reqwest::Response, Response> {
-    let auth = match load_and_refresh_auth().await {
+    let auth_candidates = match load_and_refresh_auth().await {
         Ok(a) => a,
         Err(e) => {
             return Err(error_response(StatusCode::UNAUTHORIZED, &e));
         }
     };
 
-    let user_agent = state.codex_user_agent().await;
-    let version = state.client_version().await;
-    let mut auth_headers = build_auth_headers(&auth, &user_agent, &version);
-    copy_codex_passthrough_headers(headers, &mut auth_headers);
-    auth_headers.insert(
-        axum::http::header::ACCEPT,
-        "text/event-stream".parse().expect("valid header value"),
-    );
-
     let url = format!("{}/responses", crate::config::UPSTREAM_BASE);
     debug!("Sending images request to upstream: {url}");
-
-    match state
-        .http
-        .post(&url)
-        .headers(auth_headers)
-        .json(body)
-        .send()
-        .await
-    {
-        Ok(r) => Ok(r),
-        Err(e) => {
-            error!("Upstream request error: {e}");
-            Err(error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("Upstream request failed: {e}"),
-            ))
-        }
-    }
+    send_responses_request_with_accounts(state, headers, body, &url, &auth_candidates).await
 }
 
-/// Handle a 401 by refreshing tokens and retrying once.
-async fn retry_on_401(
+async fn send_responses_request_with_accounts(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     body: &Value,
-    original: reqwest::Response,
+    url: &str,
+    auth_candidates: &[crate::auth::AuthTokens],
 ) -> Result<reqwest::Response, Response> {
-    if original.status() != StatusCode::UNAUTHORIZED {
-        return Ok(original);
-    }
+    let mut last_error: Option<(StatusCode, String)> = None;
+    for (idx, auth) in auth_candidates.iter().enumerate() {
+        let has_next = idx + 1 < auth_candidates.len();
+        let account = auth.account_label();
+        let mut auth_headers = build_auth_headers(
+            auth,
+            &state.codex_user_agent().await,
+            &state.client_version().await,
+        );
+        copy_codex_passthrough_headers(headers, &mut auth_headers);
+        auth_headers.insert(
+            axum::http::header::ACCEPT,
+            "text/event-stream".parse().expect("valid header value"),
+        );
 
-    info!("Received 401 from upstream, attempting token refresh...");
-    if let Some(tokens) = crate::auth::AuthTokens::load() {
-        if let Some(rt) = tokens.refresh_token.clone() {
-            match crate::auth::refresh_token(&rt).await {
+        let mut resp = match state
+            .http
+            .post(url)
+            .headers(auth_headers)
+            .json(body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Upstream request error for {account}: {e}");
+                if has_next {
+                    last_error = Some((
+                        StatusCode::BAD_GATEWAY,
+                        format!("Upstream request failed: {e}"),
+                    ));
+                    continue;
+                }
+                return Err(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Upstream request failed: {e}"),
+                ));
+            }
+        };
+
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            info!("Received 401 from upstream for {account}, attempting token refresh...");
+            match crate::auth::refresh_existing_token(auth).await {
                 Ok(refreshed) => {
-                    let mut auth_headers = build_auth_headers(
+                    let mut retry_headers = build_auth_headers(
                         &refreshed,
                         &state.codex_user_agent().await,
                         &state.client_version().await,
                     );
-                    copy_codex_passthrough_headers(headers, &mut auth_headers);
-                    auth_headers.insert(
+                    copy_codex_passthrough_headers(headers, &mut retry_headers);
+                    retry_headers.insert(
                         axum::http::header::ACCEPT,
                         "text/event-stream".parse().expect("valid header value"),
                     );
-                    let url = format!("{}/responses", crate::config::UPSTREAM_BASE);
                     match state
                         .http
-                        .post(&url)
-                        .headers(auth_headers)
+                        .post(url)
+                        .headers(retry_headers)
                         .json(body)
                         .send()
                         .await
                     {
-                        Ok(r) => return Ok(r),
+                        Ok(r) => resp = r,
                         Err(e) => {
+                            if has_next {
+                                last_error = Some((
+                                    StatusCode::BAD_GATEWAY,
+                                    format!("Retry upstream request failed: {e}"),
+                                ));
+                                continue;
+                            }
                             return Err(error_response(
                                 StatusCode::BAD_GATEWAY,
                                 &format!("Retry upstream request failed: {e}"),
@@ -483,17 +498,36 @@ async fn retry_on_401(
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Token refresh failed: {e}");
-                }
+                Err(e) => error!("Token refresh failed for {account}: {e}"),
             }
         }
+
+        let status = resp.status();
+        if status.is_success() || !has_next || !crate::auth::should_fallback_status(status) {
+            return Ok(resp);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        error!("Upstream error for {account} ({status}): {body}");
+        info!("Falling back from {account} after upstream status {status}");
+        last_error = Some((status, body));
     }
 
-    Err(error_response(
-        StatusCode::UNAUTHORIZED,
-        "Token refresh failed",
-    ))
+    let (status, message) = last_error.unwrap_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "No configured auth accounts are usable".to_string(),
+        )
+    });
+    Err(error_response(status, &message))
+}
+
+async fn retry_on_401(
+    _state: &Arc<AppState>,
+    _headers: &HeaderMap,
+    _body: &Value,
+    original: reqwest::Response,
+) -> Result<reqwest::Response, Response> {
+    Ok(original)
 }
 
 // ── Non-streaming collector ───────────────────────────────────────────────
@@ -1102,10 +1136,6 @@ mod tests {
 
 // ── Auth helper ───────────────────────────────────────────────────────────
 
-async fn load_and_refresh_auth() -> Result<crate::auth::AuthTokens, String> {
-    let tokens = crate::auth::AuthTokens::load()
-        .ok_or_else(|| "Not authenticated. Run `codex-openai-proxy login`.".to_string())?;
-    crate::auth::ensure_valid_token(tokens)
-        .await
-        .map_err(|e: anyhow::Error| e.to_string())
+async fn load_and_refresh_auth() -> Result<Vec<crate::auth::AuthTokens>, String> {
+    crate::auth::load_and_refresh_auth_candidates().await
 }

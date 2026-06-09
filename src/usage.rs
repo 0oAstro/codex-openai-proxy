@@ -49,24 +49,9 @@ pub struct CreditsSnapshot {
 pub async fn handle_usage(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<UsageResponse>, (StatusCode, String)> {
-    let auth = crate::auth::AuthTokens::load().ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            "Not authenticated. Run `codex-openai-proxy login`.".into(),
-        )
-    })?;
-    let auth = crate::auth::ensure_valid_token(auth)
+    let auth_candidates = crate::auth::load_and_refresh_auth_candidates()
         .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
-
-    let user_agent = state.codex_user_agent().await;
-    let mut auth_headers = build_auth_headers(&auth, &user_agent, &state.client_version().await);
-    auth_headers.insert(
-        "openai-beta",
-        "responses=experimental"
-            .parse()
-            .expect("valid header value"),
-    );
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
 
     let version = state.client_version().await;
     let url = format!("{}/responses?client_version={version}", UPSTREAM_BASE);
@@ -82,40 +67,67 @@ pub async fn handle_usage(
         "stream": true
     });
 
-    let resp = state
-        .http
-        .post(url)
-        .headers(auth_headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
+    let mut last_error = None;
+    for auth in auth_candidates.iter() {
+        let user_agent = state.codex_user_agent().await;
+        let mut auth_headers = build_auth_headers(auth, &user_agent, &state.client_version().await);
+        auth_headers.insert(
+            "openai-beta",
+            "responses=experimental"
+                .parse()
+                .expect("valid header value"),
+        );
+
+        let resp = match state
+            .http
+            .post(&url)
+            .headers(auth_headers)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                last_error = Some((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Upstream request failed: {e}"),
+                ));
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        let header_limits = parse_all_rate_limits(resp.headers());
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if crate::auth::should_fallback_status(status) {
+                last_error = Some((status, body));
+                continue;
+            }
+            return Err((status, body));
+        }
+
+        let mut rate_limits = header_limits;
+        let raw = resp.text().await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Upstream request failed: {e}"),
+                format!("Failed to read upstream: {e}"),
             )
         })?;
+        rate_limits.extend(parse_rate_limit_events(&raw));
+        dedupe_rate_limits(&mut rate_limits);
 
-    let status = resp.status();
-    let header_limits = parse_all_rate_limits(resp.headers());
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err((status, body));
+        return Ok(Json(UsageResponse {
+            object: "codex.usage",
+            rate_limits,
+        }));
     }
 
-    let mut rate_limits = header_limits;
-    let raw = resp.text().await.map_err(|e| {
+    Err(last_error.unwrap_or_else(|| {
         (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to read upstream: {e}"),
+            StatusCode::UNAUTHORIZED,
+            "No configured auth accounts are usable".to_string(),
         )
-    })?;
-    rate_limits.extend(parse_rate_limit_events(&raw));
-    dedupe_rate_limits(&mut rate_limits);
-
-    Ok(Json(UsageResponse {
-        object: "codex.usage",
-        rate_limits,
     }))
 }
 

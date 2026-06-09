@@ -157,30 +157,34 @@ impl ModelsCache {
 pub async fn handle_models(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<OpenAIModelList>, (axum::http::StatusCode, String)> {
-    let auth = crate::auth::AuthTokens::load().ok_or_else(|| {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Not authenticated. Run `codex-openai-proxy login`.".into(),
-        )
-    })?;
-    let auth: crate::auth::AuthTokens = crate::auth::ensure_valid_token(auth)
+    let auth_candidates = crate::auth::load_and_refresh_auth_candidates()
         .await
-        .map_err(|e: anyhow::Error| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))?;
+        .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e))?;
 
-    let user_agent = state.codex_user_agent().await;
-    let version = state.client_version().await;
-    let auth_headers = build_auth_headers(&auth, &user_agent, &version);
+    let mut last_error = None;
+    for auth in auth_candidates.iter() {
+        let user_agent = state.codex_user_agent().await;
+        let version = state.client_version().await;
+        let auth_headers = build_auth_headers(auth, &user_agent, &version);
 
-    let models = state
-        .models_cache
-        .get_or_fetch(&state, &auth_headers)
-        .await
-        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+        match state.models_cache.get_or_fetch(&state, &auth_headers).await {
+            Ok(models) => {
+                return Ok(Json(OpenAIModelList {
+                    object: "list",
+                    data: models,
+                }));
+            }
+            Err(e) => {
+                warn!("Models fetch failed for {}: {e}", auth.account_label());
+                last_error = Some(e);
+            }
+        }
+    }
 
-    Ok(Json(OpenAIModelList {
-        object: "list",
-        data: models,
-    }))
+    Err((
+        axum::http::StatusCode::BAD_GATEWAY,
+        last_error.unwrap_or_else(|| "No configured auth accounts are usable".to_string()),
+    ))
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────

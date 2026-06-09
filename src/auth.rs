@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -30,6 +30,10 @@ pub struct AuthTokens {
     /// Whether the selected ChatGPT account requires the FedRAMP routing header.
     #[serde(default)]
     pub chatgpt_account_is_fedramp: bool,
+    /// Auth file this token set was loaded from. Skipped on disk so existing
+    /// Codex auth JSON stays compatible with official clients.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 impl AuthTokens {
@@ -38,16 +42,47 @@ impl AuthTokens {
         auth_file_path()
     }
 
-    /// Load tokens from disk. Returns `None` if the file does not exist.
+    /// Load tokens from disk. Returns `None` if the primary file does not exist.
     pub fn load() -> Option<Self> {
-        let p = Self::path();
-        if !p.exists() {
+        Self::load_from_path(Self::path())
+    }
+
+    pub fn load_all() -> Vec<Self> {
+        crate::config::auth_file_paths()
+            .into_iter()
+            .filter_map(Self::load_from_path)
+            .collect()
+    }
+
+    pub fn account_label(&self) -> String {
+        self.account_id
+            .as_deref()
+            .map(|id| format!("account {id}"))
+            .or_else(|| {
+                self.source_path
+                    .as_ref()
+                    .map(|path| format!("auth file {}", path.display()))
+            })
+            .unwrap_or_else(|| "auth account".to_string())
+    }
+
+    fn load_from_path(path: PathBuf) -> Option<Self> {
+        if !path.exists() {
             return None;
         }
-        match fs::read_to_string(&p) {
-            Ok(data) => parse_auth_tokens(&data).ok(),
+        match fs::read_to_string(&path) {
+            Ok(data) => match parse_auth_tokens(&data) {
+                Ok(mut tokens) => {
+                    tokens.source_path = Some(path);
+                    Some(tokens)
+                }
+                Err(e) => {
+                    error!("Failed to parse auth file {}: {e}", path.display());
+                    None
+                }
+            },
             Err(e) => {
-                error!("Failed to read auth file: {e}");
+                error!("Failed to read auth file {}: {e}", path.display());
                 None
             }
         }
@@ -55,12 +90,23 @@ impl AuthTokens {
 
     /// Persist tokens to disk, creating parent directories as needed.
     pub fn save(&self) -> anyhow::Result<()> {
-        let p = Self::path();
+        if let Some(path) = self.source_path.as_deref() {
+            self.save_to_path(path)
+        } else {
+            self.save_primary()
+        }
+    }
+
+    pub fn save_primary(&self) -> anyhow::Result<()> {
+        self.save_to_path(&Self::path())
+    }
+
+    fn save_to_path(&self, p: &Path) -> anyhow::Result<()> {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        if let Ok(existing) = fs::read_to_string(&p) {
+        if let Ok(existing) = fs::read_to_string(p) {
             if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&existing) {
                 if value.get("tokens").is_some() {
                     value["tokens"]["access_token"] =
@@ -79,13 +125,13 @@ impl AuthTokens {
                             serde_json::Value::Bool(true);
                     }
                     value["last_refresh"] = serde_json::Value::String(Utc::now().to_rfc3339());
-                    fs::write(&p, serde_json::to_string_pretty(&value)?)?;
+                    fs::write(p, serde_json::to_string_pretty(&value)?)?;
                     return Ok(());
                 }
             }
         }
 
-        fs::write(&p, serde_json::to_string_pretty(self)?)?;
+        fs::write(p, serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
 
@@ -241,6 +287,7 @@ pub(crate) fn parse_auth_tokens(data: &str) -> anyhow::Result<AuthTokens> {
             .map(ToString::to_string),
         account_id,
         chatgpt_account_is_fedramp,
+        source_path: None,
     })
 }
 
@@ -382,6 +429,21 @@ async fn exchange_code(code: &str, verifier: &str) -> anyhow::Result<AuthTokens>
 
 /// Refresh an access token using a refresh token.
 pub async fn refresh_token(refresh: &str) -> anyhow::Result<AuthTokens> {
+    refresh_token_with_source(refresh, None).await
+}
+
+pub async fn refresh_existing_token(tokens: &AuthTokens) -> anyhow::Result<AuthTokens> {
+    let refresh = tokens
+        .refresh_token
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("No refresh token available for this account"))?;
+    refresh_token_with_source(refresh, tokens.source_path.clone()).await
+}
+
+async fn refresh_token_with_source(
+    refresh: &str,
+    source_path: Option<PathBuf>,
+) -> anyhow::Result<AuthTokens> {
     info!("Refreshing access token…");
     let client = reqwest::Client::new();
     let resp = client
@@ -402,7 +464,8 @@ pub async fn refresh_token(refresh: &str) -> anyhow::Result<AuthTokens> {
     }
 
     let raw: serde_json::Value = resp.json().await?;
-    let tokens = parse_token_response(raw)?;
+    let mut tokens = parse_token_response(raw)?;
+    tokens.source_path = source_path;
     tokens.save()?;
     Ok(tokens)
 }
@@ -436,11 +499,51 @@ pub async fn ensure_valid_token(tokens: AuthTokens) -> anyhow::Result<AuthTokens
         return Ok(tokens);
     }
     match tokens.refresh_token.as_deref() {
-        Some(rt) => refresh_token(rt).await,
+        Some(rt) => refresh_token_with_source(rt, tokens.source_path.clone()).await,
         None => anyhow::bail!(
             "Token expired and no refresh token available. Please run `codex-openai-proxy login`."
         ),
     }
+}
+
+pub async fn load_and_refresh_auth_candidates() -> Result<Vec<AuthTokens>, String> {
+    let tokens = AuthTokens::load_all();
+    if tokens.is_empty() {
+        return Err("Not authenticated. Run `codex-openai-proxy login`.".to_string());
+    }
+
+    let mut ready = Vec::new();
+    let mut errors = Vec::new();
+    for token in tokens {
+        let label = token
+            .source_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        match ensure_valid_token(token).await {
+            Ok(valid) => ready.push(valid),
+            Err(e) => errors.push(format!("{label}: {e}")),
+        }
+    }
+
+    if ready.is_empty() {
+        Err(format!(
+            "No configured auth accounts are usable: {}",
+            errors.join("; ")
+        ))
+    } else {
+        Ok(ready)
+    }
+}
+
+pub fn should_fallback_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::PAYMENT_REQUIRED
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+    )
 }
 
 // ── internals ─────────────────────────────────────────────────────────────
@@ -633,6 +736,7 @@ fn parse_token_response(raw: serde_json::Value) -> anyhow::Result<AuthTokens> {
         obtained_at: Some(Utc::now().to_rfc3339()),
         account_id,
         chatgpt_account_is_fedramp,
+        source_path: None,
     })
 }
 

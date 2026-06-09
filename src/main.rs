@@ -175,6 +175,7 @@ async fn health_handler() -> axum::Json<serde_json::Value> {
 
 async fn run_login() -> anyhow::Result<()> {
     let tokens = auth::login_flow().await?;
+    tokens.save_primary()?;
     println!("Logged in successfully.");
     if let Some(ref aid) = tokens.account_id {
         println!("Account ID: {aid}");
@@ -184,6 +185,7 @@ async fn run_login() -> anyhow::Result<()> {
 
 async fn run_login_device() -> anyhow::Result<()> {
     let tokens = auth::device_login_flow().await?;
+    tokens.save_primary()?;
     println!("Logged in successfully via device code.");
     if let Some(ref aid) = tokens.account_id {
         println!("Account ID: {aid}");
@@ -203,7 +205,7 @@ async fn run_logout() -> anyhow::Result<()> {
 }
 
 async fn run_auth_status() -> anyhow::Result<()> {
-    match auth::AuthTokens::load() {
+    match auth::AuthTokens::load_all().first().cloned() {
         Some(tokens) => {
             println!("Authenticated: yes");
             if let Some(ref aid) = tokens.account_id {
